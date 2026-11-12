@@ -1,0 +1,87 @@
+name: test
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+on:
+  pull_request: { types: [opened, reopened, synchronize, ready_for_review] }
+  push: { branches: [main] }
+
+permissions:
+  contents: read
+
+jobs:
+  # Concurrency requirement 3 and 6: no allowlist, the first occurrence fails the job.
+  forbidden-constructs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Reject unsafe concurrency escapes and manual threading
+        run: |
+          pattern='@unchecked[[:space:]]+Sendable|nonisolated\(unsafe\)|@preconcurrency|DispatchQueue|DispatchSemaphore|OperationQueue|NSLock|NSRecursiveLock|os_unfair_lock|pthread_mutex|Thread\.(detach|sleep)|[^A-Za-z]Thread\('
+          if grep -rnE "$pattern" Sources Tests; then
+            echo "::error::forbidden construct found (see the design's concurrency requirements)"
+            exit 1
+          fi
+      - name: Reject unsafeFlags in the manifest
+        run: |
+          if grep -n "unsafeFlags" Package.swift; then
+            echo "::error::warnings-as-errors belongs on the command line, never in the manifest"
+            exit 1
+          fi
+
+  macos:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_26.app
+      - name: Build with zero warnings
+        run: swift build --build-tests -Xswiftc -warnings-as-errors
+      - name: Test with coverage
+        run: swift test --enable-code-coverage
+      - name: Coverage gate (97 % per target, 100 % on crash-critical files)
+        run: Scripts/coverage-gate.sh --baseline coverage-baseline.json
+      - name: Release build
+        run: swift build -c release -Xswiftc -warnings-as-errors
+
+  thread-sanitizer:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_26.app
+      - name: Test under TSan
+        run: swift test --sanitize=thread
+
+  ios-simulator:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_26.app
+      # SWIFT_TREAT_WARNINGS_AS_ERRORS is not set here: Xcode rejects it next to swift-log's own
+      # -suppress-warnings. Zero warnings in this package's code is enforced by the macOS job.
+      - name: Build every product for the iOS Simulator
+        run: |
+          xcodebuild build \
+            -scheme ztron-paywall-kit-Package \
+            -destination 'generic/platform=iOS Simulator' \
+            -skipPackagePluginValidation
+
+  # The core must not depend on Darwin. PaywallKit, PaywallCloudSync and PaywallSimulator are Darwin-only targets
+  # and are not part of the Linux graph.
+  linux:
+    runs-on: ubuntu-latest
+    container: swift:6.3-noble
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install python3 for the coverage gate
+        run: command -v python3 || (apt-get update && apt-get install -y python3)
+      - name: Build with zero warnings
+        run: swift build --build-tests -Xswiftc -warnings-as-errors
+      - name: Test with coverage
+        run: swift test --enable-code-coverage
+      - name: Coverage gate (core targets)
+        run: Scripts/coverage-gate.sh --targets "PaywallCore PaywallTesting"
+      - name: Test under TSan
+        run: swift test --sanitize=thread

@@ -1,0 +1,22 @@
+{
+  "PaywallCloudSync": {
+    "lines": 55.91,
+    "regions": 57.89
+  },
+  "PaywallCore": {
+    "lines": 99.6,
+    "regions": 97.35
+  },
+  "PaywallKit": {
+    "lines": 79.7,
+    "regions": 75.27
+  },
+  "PaywallSimulator": {
+    "lines": 97.84,
+    "regions": 90.81
+  },
+  "PaywallTesting": {
+    "lines": 98.08,
+    "regions": 93.42
+  }
+}
