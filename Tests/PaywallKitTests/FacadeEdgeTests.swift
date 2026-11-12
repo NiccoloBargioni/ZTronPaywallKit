@@ -60,6 +60,29 @@
             }
         }
 
+        @Test func reconfiguring_cancels_a_pending_fallback() async {
+            let (paywall, _, _) = await makePaywall()
+            _ = paywall.evaluate(.paid, id: "heatmap")  // fallback scheduled for the end of the turn
+            let (_, store, clock) = await makePaywall()
+            var configuration = Paywall.Configuration(catalog: catalog)
+            configuration.store = store
+            configuration.clock = clock
+            configuration.connectivity = nil
+            configuration.includesDefaultAudit = false
+            configuration.storageDirectory = makeTemporaryPaywallDirectory()
+            paywall.configure(configuration)
+            await settle()
+            #expect(paywall.pendingFailure == nil)  // the old engine's denial never surfaces on the new one
+        }
+
+        @Test func unconfigured_sessions_open_free_and_deny_the_rest() {
+            let unconfigured = Paywall()
+            let free = unconfigured.openSession(holder: UUID(), level: .free, policy: .reserve, source: gate, scope: nil) { _ in }
+            #expect(free.isOpen)
+            let paid = unconfigured.openSession(holder: UUID(), level: .paid, policy: .reserve, source: gate, scope: "s") { _ in }
+            #expect(paid.failure?.reason == .entitlementUnavailable)
+        }
+
         @Test func failure_preference_keeps_the_latest_non_nil_value() {
             let failure = PaywallFailure(reason: .requiresPaid, level: .paid, source: gate, at: Date())
             var value: PaywallFailure? = nil

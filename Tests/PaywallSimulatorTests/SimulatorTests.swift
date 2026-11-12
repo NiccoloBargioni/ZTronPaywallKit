@@ -4,6 +4,7 @@
     import Foundation
     import PaywallCore
     import PaywallKit
+    import PaywallTesting
     import SwiftUI
     import Testing
 
@@ -288,6 +289,16 @@
             await PaywallSimulator.shared.settle()
             let cached = try await Paywall.shared.products()
             #expect(cached.allSatisfy { !$0.isPurchasable && $0.priceAsOf != nil })
+        }
+
+        @Test func network_switch_drives_the_network_path() async {
+            await configure(PaywallSimulation(.free))
+            #expect(await PaywallSimulator.shared.connectivity.hasPath)
+            PaywallSimulator.shared.simulation.network = false
+            await PaywallSimulator.shared.settle()
+            #expect(await !PaywallSimulator.shared.connectivity.hasPath)
+            for _ in 0..<100 where Paywall.shared.engine?.hasNetworkPath != false { await Task.yield() }
+            #expect(Paywall.shared.engine?.hasNetworkPath == false)
         }
 
         @Test func launch_arguments_configure_the_matching_gate() async {

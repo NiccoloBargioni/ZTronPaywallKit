@@ -101,7 +101,7 @@ struct CrashSafetyTests {
         #expect(engine.wallet == Wallet(balance: 5, reserved: 0))
     }
 
-    @Test func credit_append_before_finish_is_idempotent_across_relaunch() async throws {
+    @Test func interrupted_purchase_delivers_once_on_relaunch() async throws {
         let h = try await Harness.free()
         let tx = StoreTransaction.tokenPack(id: 11, productID: "tokens.10", purchased: h.clock.now)
         // Credit written, process dies before finish(): StoreKit re-delivers at launch.

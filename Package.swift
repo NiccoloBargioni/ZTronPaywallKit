@@ -86,6 +86,7 @@ var targets: [Target] = [
             dependencies: [
                 .target(name: "PaywallSimulator"),
                 .target(name: "PaywallKit"),
+                .target(name: "PaywallTesting"),
             ],
             swiftSettings: swiftSettings
         ),

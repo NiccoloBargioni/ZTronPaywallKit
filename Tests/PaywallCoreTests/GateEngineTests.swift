@@ -353,7 +353,7 @@ struct GateEngineTests {
         #expect(await h.store.purchaseCalls == 0)
     }
 
-    @Test func offline_products_carry_as_of_prices_and_disable_buy() async throws {
+    @Test func cached_prices_carry_as_of_label() async throws {
         let h = try await Harness.free()
         let online = try await h.engine.products()
         #expect(online.count == 6)
@@ -368,7 +368,7 @@ struct GateEngineTests {
         await #expect(throws: FakeStore.Failure.self) { _ = try await fresh.engine.products() }
     }
 
-    @Test func grandfathered_install_logs_once_and_survives_offline_launch() async throws {
+    @Test func grandfather_survives_offline_launch() async throws {
         let now = FakeClock().now
         let policy = GrandfatheringPolicy(lastPaidBuild: "116", paidWindow: DateInterval(start: now.addingTimeInterval(-1e7), end: now))
         let h = try Harness(grandfathering: policy)

@@ -54,6 +54,16 @@ public final class GateEngine {
         public var compactionThreshold: Int
         /// The outbox drains at most once per interval.
         public var syncCoalescing: TimeInterval
+        #if DEBUG
+            /// Debug builds only: what the resolver sees as the original purchase. See `GrandfatherOverride`.
+            public var grandfatherOverride: GrandfatherOverride?
+
+            public func with(grandfatherOverride: GrandfatherOverride?) -> Settings {
+                var copy = self
+                copy.grandfatherOverride = grandfatherOverride
+                return copy
+            }
+        #endif
 
         public init(
             tolerance: TimeInterval = 300,
@@ -126,6 +136,10 @@ public final class GateEngine {
     var snapshotTask: Task<Void, Never>?
     var lastSyncAt: Date?
     var runningSync: Task<Void, Never>?
+    var connectivityTask: Task<Void, Never>?
+    let connectivity: (any PaywallConnectivity)?
+    /// False while the connectivity source reports no network path: the outbox waits, and drains on return.
+    public internal(set) var hasNetworkPath = true
 
     // MARK: Observation
 
@@ -148,9 +162,11 @@ public final class GateEngine {
         clock: any PaywallClock,
         store: any StoreClient,
         sync: (any LedgerSync)? = nil,
+        connectivity: (any PaywallConnectivity)? = nil,
         audit sinks: [any PaywallAuditSink] = [],
         logger: Logger = Logger(label: "ztron.paywall")
     ) throws(JournalError) {
+        self.connectivity = connectivity
         self.directory = directory
         self.catalog = catalog
         self.grandfathering = grandfathering
@@ -192,6 +208,7 @@ public final class GateEngine {
         if let sync { baseline = await sync.loadSnapshot() }
         recomputeLeasesAndWallet(notify: true)
         await startUpdatesListener()
+        await startConnectivityListener()
         await refresh(cause: .launch)
         scheduleSync(immediately: true)
     }
@@ -203,6 +220,8 @@ public final class GateEngine {
         syncTask?.cancel()
         runningSync?.cancel()
         snapshotTask?.cancel()
+        connectivityTask?.cancel()
+        connectivityTask = nil
         updatesTask = nil
         expiryTask = nil
         syncTask = nil
@@ -495,23 +514,26 @@ public final class GateEngine {
 
     // MARK: Simulation (ZTronPaywallSimulator only)
 
-    /// Moves the balance to `target` with one grant of the difference (negative allowed). Simulator only: the
-    /// production paths for tokens are StoreKit credits and explicit grants.
-    @_spi(PaywallSimulation)
-    public func simulateBalance(_ target: Int) {
-        let delta = target - wallet.balance
-        guard delta != 0 else { return }
-        if appendLedger(id: "grant:simulated:\(UUID().uuidString)", kind: .grant(tokens: delta, reason: "simulated")) != nil {
-            emit(.tokensGranted(n: delta, reason: "simulated"))
+    // Compiled out of release builds with the simulator (Scripts/check-release-symbols.sh).
+    #if DEBUG
+        /// Moves the balance to `target` with one grant of the difference (negative allowed). Simulator only: the
+        /// production paths for tokens are StoreKit credits and explicit grants.
+        @_spi(PaywallSimulation)
+        public func simulateBalance(_ target: Int) {
+            let delta = target - wallet.balance
+            guard delta != 0 else { return }
+            if appendLedger(id: "grant:simulated:\(UUID().uuidString)", kind: .grant(tokens: delta, reason: "simulated")) != nil {
+                emit(.tokensGranted(n: delta, reason: "simulated"))
+            }
         }
-    }
 
-    /// Sets the entitlement ahead of the store resolution that will confirm it, so a preview renders the right
-    /// state on its first frame. Simulator only.
-    @_spi(PaywallSimulation)
-    public func simulateEntitlement(_ entitlement: Entitlement) {
-        setEntitlement(entitlement, cause: .simulation)
-    }
+        /// Sets the entitlement ahead of the store resolution that will confirm it, so a preview renders the right
+        /// state on its first frame. Simulator only.
+        @_spi(PaywallSimulation)
+        public func simulateEntitlement(_ entitlement: Entitlement) {
+            setEntitlement(entitlement, cause: .simulation)
+        }
+    #endif
 
     // MARK: Termination (crash-safety proof)
 
@@ -581,7 +603,7 @@ struct PaywallFiles {
     }
 
     func grandfatherLogged() -> Bool { FileManager.default.fileExists(atPath: url("grandfathered.logged").path) }
-    func markGrandfatherLogged() { FileManager.default.createFile(atPath: url("grandfathered.logged").path, contents: Data()) }
+    func markGrandfatherLogged() { _ = FileManager.default.createFile(atPath: url("grandfathered.logged").path, contents: Data()) }
 
     struct PriceCache: Codable {
         var products: [PaywallProduct]

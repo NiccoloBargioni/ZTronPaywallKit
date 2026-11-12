@@ -33,6 +33,7 @@ func makePaywall(
     configuration.clock = clock
     configuration.storageDirectory = makeTemporaryPaywallDirectory()
     configuration.includesDefaultAudit = false
+    configuration.connectivity = nil
     configuration.audit = audit
     paywall.configure(configuration)
     await paywall.waitUntilStarted()
@@ -270,6 +271,7 @@ struct PaywallFacadeTests {
 }
 
 @Suite("Disclosure and signals")
+@MainActor
 struct DisclosureTests {
     let terms = URL(string: "https://example.com/terms")!
     let privacy = URL(string: "https://example.com/privacy")!
@@ -280,13 +282,58 @@ struct DisclosureTests {
             #expect(disclosure.isComplete, "\(product.id)")
             #expect(disclosure.links == [terms, privacy])
         }
+        #expect(PaywallDisclosure(product: products[3], whatYouGet: "x", termsURL: terms, privacyURL: privacy).period == nil)
+        #expect(!PaywallDisclosure(product: products[1], whatYouGet: "", termsURL: terms, privacyURL: privacy).isComplete)
+    }
+
+    /// 3.1.2(a): the trial length and what it costs afterwards, before the purchase.
+    @Test func trial_disclosure_shows_length_and_post_trial_price() {
         let weekly = PaywallDisclosure(product: products[0], whatYouGet: "All tools", termsURL: terms, privacyURL: privacy)
         #expect(weekly.trial == "7-day free trial, then €1.99 per week")
         #expect(weekly.period == "per week")
         #expect(weekly.renewal?.contains("€1.99") == true)
-        #expect(PaywallDisclosure(product: products[3], whatYouGet: "x", termsURL: terms, privacyURL: privacy).period == nil)
-        #expect(!PaywallDisclosure(product: products[1], whatYouGet: "", termsURL: terms, privacyURL: privacy).isComplete)
+        var noTrial = products[0]
+        noTrial.introOffer = nil
+        #expect(PaywallDisclosure(product: noTrial, whatYouGet: "x", termsURL: terms, privacyURL: privacy).trial == nil)
     }
+
+    /// Package half of 3.1.1: the disclosure's price is StoreKit's `displayPrice`, and its only links are the
+    /// Terms and Privacy URLs. The host's screen tests check that the paywall renders these values.
+    @Test func paywall_prices_come_from_storekit_only() async throws {
+        let (paywall, store, _) = await makePaywall()
+        var repriced = products
+        repriced[2].displayPrice = "$34.99"
+        await store.setProducts(repriced)
+        let yearly = try #require(try await paywall.products().first { $0.id == "pro.yearly" })
+        let disclosure = PaywallDisclosure(product: yearly, whatYouGet: "x", termsURL: terms, privacyURL: privacy)
+        #expect(disclosure.price == "$34.99")
+        #expect(disclosure.links == [terms, privacy])
+    }
+
+    @Test func network_path_connectivity_reports_the_current_path() async {
+        var first: Bool?
+        for await hasPath in await NetworkPathConnectivity().paths() {
+            first = hasPath
+            break
+        }
+        #expect(first != nil)
+    }
+
+    #if DEBUG
+        @Test func configuration_passes_the_grandfather_override_to_the_engine() async {
+            let paywall = Paywall()
+            var configuration = Paywall.Configuration(catalog: catalog)
+            configuration.store = FakeStore(products: products)
+            configuration.clock = FakeClock()
+            configuration.connectivity = nil
+            configuration.includesDefaultAudit = false
+            configuration.storageDirectory = makeTemporaryPaywallDirectory()
+            let override = GrandfatherOverride(originalAppVersion: "90", originalPurchaseDate: Date())
+            configuration.grandfatherOverride = override
+            paywall.configure(configuration)
+            #expect(paywall.engine?.settings.grandfatherOverride == override)
+        }
+    #endif
 
     @Test func oslog_categories_cover_every_event() async {
         let failure = PaywallFailure(reason: .requiresPaid, level: .paid, source: PaywallSource(fileID: "f", function: "g", line: 1), at: Date())

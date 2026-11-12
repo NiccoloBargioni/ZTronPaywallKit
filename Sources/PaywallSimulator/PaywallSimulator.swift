@@ -26,6 +26,8 @@
         public private(set) var store = SimulatedStore()
         public private(set) var clock = SimulatedClock(now: Date())
         public private(set) var sync = InMemoryLedgerSync()
+        /// Follows the `network` switch.
+        public private(set) var connectivity = FakeConnectivity()
         public private(set) var directory = PaywallSimulator.freshDirectory()
         public private(set) var catalog: ProductCatalog?
         public private(set) var grandfathering: GrandfatheringPolicy?
@@ -57,6 +59,7 @@
             store = SimulatedStore()
             clock = SimulatedClock(now: Date())
             sync = InMemoryLedgerSync()
+            connectivity = FakeConnectivity(hasPath: simulation.network)
             directory = Self.freshDirectory()
             self.catalog = catalog
             self.grandfathering = grandfathering ?? Self.simulatedPolicy
@@ -67,18 +70,20 @@
             configuration.store = store
             configuration.clock = clock
             configuration.sync = sync
+            configuration.connectivity = connectivity
             configuration.storageDirectory = directory
             configuration.environmentLabel = "simulated"
             configuration.grandfathering = self.grandfathering
             configuration.tolerance = simulation.tolerance ?? configuration.tolerance
             configuration.includesDefaultAudit = true
             let store = store
+            let connectivity = connectivity
             let snapshot = storeState(for: simulation)
             configuration.onStart = { [weak self] engine in
                 await self?.seed(engine)
             }
             // The store must hold the simulated state before the first resolution reads it.
-            applyTask = Task { await Self.push(snapshot, to: store) }
+            applyTask = Task { await Self.push(snapshot, to: store, connectivity: connectivity) }
             return configuration
         }
 
@@ -189,10 +194,11 @@
             let next = simulation
             let snapshot = storeState(for: next)
             let store = store
+            let connectivity = connectivity
             let previous = applyTask
             applyTask = Task { [weak self] in
                 await previous?.value
-                await Self.push(snapshot, to: store)
+                await Self.push(snapshot, to: store, connectivity: connectivity)
                 guard let self, let engine = self.engine else { return }
                 if next.tokens != old.tokens || next.tokens != engine.wallet.balance { engine.simulateBalance(next.tokens) }
                 if let tolerance = next.tolerance { engine.settings.tolerance = tolerance }
@@ -263,7 +269,8 @@
                 products: Self.products(for: catalog, introEligible: simulation.introOfferEligible))
         }
 
-        static func push(_ state: StoreState, to store: SimulatedStore) async {
+        static func push(_ state: StoreState, to store: SimulatedStore, connectivity: FakeConnectivity) async {
+            await connectivity.set(state.network)
             await store.setEntitlements(state.entitlements)
             await store.setApp(state.app)
             await store.setReachable(state.reachable)

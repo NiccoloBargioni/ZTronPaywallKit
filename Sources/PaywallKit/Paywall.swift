@@ -29,6 +29,8 @@ public final class Paywall: ObservableObject {
         public var includesDefaultAudit = true
         /// CloudKit, your server, or nil.
         public var sync: (any LedgerSync)?
+        /// The outbox drains only while a network path exists, and at once when one returns.
+        public var connectivity: (any PaywallConnectivity)? = NetworkPathConnectivity()
         /// Injectable for tests and the simulator.
         public var clock: any PaywallClock = SystemClock()
         public var store: any StoreClient = StoreKit2Client()
@@ -40,6 +42,10 @@ public final class Paywall: ObservableObject {
         public var fullSync = true
         /// Runs once the launch resolution finished (the simulator seeds its switches here).
         public var onStart: (@MainActor (GateEngine) async -> Void)?
+        #if DEBUG
+            /// Debug builds only: the debug-menu override for testing grandfathering on a device.
+            public var grandfatherOverride: GrandfatherOverride?
+        #endif
 
         public init(catalog: ProductCatalog) {
             self.catalog = catalog
@@ -97,7 +103,7 @@ public final class Paywall: ObservableObject {
             sinks.append(OSLogSink())
         }
         let info = Bundle.main.infoDictionary
-        let settings = GateEngine.Settings(
+        let base = GateEngine.Settings(
             tolerance: configuration.tolerance,
             leasePolicy: configuration.leasePolicy,
             environmentLabel: configuration.environmentLabel,
@@ -105,11 +111,17 @@ public final class Paywall: ObservableObject {
             build: info?["CFBundleVersion"] as? String ?? "0",
             fullSync: configuration.fullSync
         )
+        #if DEBUG
+            let settings = base.with(grandfatherOverride: configuration.grandfatherOverride)
+        #else
+            let settings = base
+        #endif
         let engine: GateEngine
         do {
             engine = try GateEngine(
                 directory: directory, catalog: configuration.catalog, grandfathering: configuration.grandfathering,
                 settings: settings, clock: configuration.clock, store: configuration.store, sync: configuration.sync,
+                connectivity: configuration.connectivity,
                 audit: sinks)
         } catch {
             logger.error("paywall: journal unavailable", metadata: ["error": "\(error)"])

@@ -105,7 +105,7 @@ public actor JournalSink: PaywallAuditRepairing {
             _ = try? handle.seekToEnd()
             try? handle.write(contentsOf: line)
         } else {
-            fm.createFile(atPath: currentURL.path, contents: line)
+            _ = fm.createFile(atPath: currentURL.path, contents: line)
         }
     }
 

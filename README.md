@@ -40,6 +40,16 @@ Paywall.shared.configure(configuration)
 first frame. If the catalog is invalid or the journal can't be opened, `configurationError` is set and every
 gate except `.free` fails closed.
 
+`configuration.connectivity` defaults to `NetworkPathConnectivity` (NWPathMonitor). The outbox drains only
+while a network path exists, and immediately when one returns. On iOS 15–16 and macOS 12–13 the monitor can
+only report on a dispatch queue, which the package doesn't use, so there the outbox relies on its other
+triggers: launch, foreground, purchase and the 30-second timer.
+
+To test grandfathering on a device (TestFlight and the sandbox can't reach it), debug builds have
+`configuration.grandfatherOverride = GrandfatherOverride(originalAppVersion:originalPurchaseDate:)`. It changes
+only what the resolver sees; the account key, and with it the wallet, still come from the real AppTransaction.
+It's compiled out of release builds.
+
 ## Gating
 
 ```swift
@@ -113,6 +123,19 @@ PaywallSimulator.shared.refund(.lastTokenPack)
 PaywallSimulator.shared.advance(by: 301)
 ```
 
+## App Review
+
+The design maps each App Review rejection cause to a named test. This package holds the package half:
+`AppReviewTests`, `EdgeCaseTests` and `AuditTableTests` in `PaywallCoreTests`, plus the disclosure tests in
+`PaywallKitTests`.
+
+`ProductCatalog.mismatches(withStoreKitConfiguration:)` compares the catalog with a `.storekit` file. It reports
+missing products, wrong types, wrong renewal periods and subscriptions split across groups. The host's
+`catalog_matches_storekit_configuration` test calls it on its own file.
+
+`Scripts/check-release-symbols.sh` builds release and fails if a shipping module contains simulator, preset,
+launch-argument, fake, override or simulation-hook symbols, or if `PaywallSimulator` is not empty.
+
 ## Development
 
 ```bash
@@ -147,15 +170,16 @@ CI (`.github/workflows/test.yml`) runs:
 - TSan.
 - An iOS Simulator build.
 - Linux: the core targets, their coverage gate, and TSan.
+- On macOS and Linux: the release-symbol check.
 
 ### Current coverage
 
 | Target | Lines | Regions | Gate |
 |---|---|---|---|
-| PaywallCore | 99.6% | 97.4% | ok, all 7 crash-critical files at 100/100 |
-| PaywallTesting | 98.1% | 93.4% | ok |
-| PaywallSimulator | 97.8% | 90.8% | ok |
-| PaywallKit | 79.7% | 75.3% | **fails**: `StoreKit2Client.swift` (163 lines) runs only under SKTestSession. The rest of the target is at about 98%. |
+| PaywallCore | 99.7% | 97.6% | ok, all 7 crash-critical files at 100/100 |
+| PaywallTesting | 98.3% | 93.9% | ok |
+| PaywallSimulator | 97.9% | 90.9% | ok |
+| PaywallKit | 80.3% | 75.9% | **fails**: `StoreKit2Client.swift` (163 lines) runs only under SKTestSession. The rest of the target is at about 98%. |
 | PaywallCloudSync | 55.9% | 57.9% | **fails**: `CloudKitDatabase.swift` (73 lines) needs a CloudKit container. The rest is covered by the in-memory fake. |
 
 The design allows no exclusions. StoreKit2Client is meant to be exercised by SKTestSession in an
@@ -168,7 +192,13 @@ gate with `--xccov`.
 - **Routing**: the `ZRouteGate` hook belongs in `ztron-routing-kit`.
 - **Adoption**: integrating the package into the host app.
 - **Hosted lanes**: `StoreKitIntegrationTests` (SKTestSession: refunds, Ask to Buy, renewals at accelerated
-  time), `UIKitBoundaryTests` for `PaywallHostingController`, the `AppReviewTests` suite, and
-  `Scripts/presubmit.sh`. These need an app host and a `.storekit` configuration file.
+  time), `UIKitBoundaryTests` for `PaywallHostingController` on the iOS 15 and iOS 17 simulators, the
+  xcodebuild coverage lane, and the 25 ms draw performance test on a device. These need an app host and a
+  `.storekit` configuration file.
+- **The host half of the App Review table**: the paywall screen (restore button, links, disclosures, retry
+  when products fail, hiding Buy for the current tier), the gated routes, the archive check over the `.ipa`,
+  and `Scripts/presubmit.sh`.
+- **Open design decisions**: promoted in-app purchases (a PurchaseIntent listener), Family Sharing for
+  tokens, macOS scope, and a runtime refusal of the simulator in non-debug processes.
 - **Receipt signature verification**: `ReceiptClient` fails closed (no grandfathering on iOS 15) until a
   `ReceiptVerifier` is supplied.

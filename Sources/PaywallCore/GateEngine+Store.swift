@@ -22,7 +22,7 @@ extension GateEngine {
             bind(fresh)
         }
         guard !isTerminated else { return }
-        let resolution = resolver.resolve(transactions: transactions, appTransaction: appTransaction, now: clock.now)
+        let resolution = resolver.resolve(transactions: transactions, appTransaction: resolverInput, now: clock.now)
         lastResolution = clock.now
         if let grandfathered = resolution.grandfathered { recordGrandfather(grandfathered) }
         setEntitlement(resolution.entitlement, cause: cause)
@@ -35,6 +35,16 @@ extension GateEngine {
             }
         }
         reevaluateSessions()
+    }
+
+    /// The app transaction the resolver sees: the bound one, unless a debug build overrides it.
+    var resolverInput: AppTransactionSnapshot? {
+        #if DEBUG
+            if let override = settings.grandfatherOverride {
+                return override.apply(to: appTransaction, bundleID: appTransaction?.bundleID ?? "debug.override")
+            }
+        #endif
+        return appTransaction
     }
 
     func bind(_ snapshot: AppTransactionSnapshot) {
@@ -58,7 +68,7 @@ extension GateEngine {
                 environment: snapshot.environment))
         }
         if case .tokens(let n) = grandfathering?.grant {
-            grant(tokens: n, reason: "grandfathered", id: "grant:grandfathered:\(snapshot.accountKey)")
+            grant(tokens: n, reason: "grandfathered", id: "grant:grandfathered:\(accountKey)")
         }
     }
 
@@ -190,6 +200,27 @@ extension GateEngine {
         scheduleSync(immediately: false)
     }
 
+    // MARK: Connectivity
+
+    func startConnectivityListener() async {
+        connectivityTask?.cancel()
+        guard let connectivity else { return }
+        let paths = await connectivity.paths()
+        connectivityTask = Task { [weak self] in
+            for await hasPath in paths {
+                guard let self, !Task.isCancelled else { return }
+                self.networkPathChanged(hasPath)
+            }
+        }
+    }
+
+    /// A returning path drains the outbox at once (and pulls), instead of waiting for the next trigger.
+    func networkPathChanged(_ hasPath: Bool) {
+        let restored = hasPath && !hasNetworkPath
+        hasNetworkPath = hasPath
+        if restored { scheduleSync(immediately: true) }
+    }
+
     // MARK: Sync
 
     /// Drains the outbox now, coalesced to one run per `syncCoalescing` seconds otherwise.
@@ -230,7 +261,7 @@ extension GateEngine {
     }
 
     private func performSync() async {
-        guard let sync, !isTerminated else { return }
+        guard let sync, !isTerminated, hasNetworkPath else { return }
         syncTask?.cancel()
         syncTask = nil
         lastSyncAt = clock.now

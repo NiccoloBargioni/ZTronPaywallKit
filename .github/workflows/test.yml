@@ -43,6 +43,8 @@ jobs:
         run: Scripts/coverage-gate.sh --baseline coverage-baseline.json
       - name: Release build
         run: swift build -c release -Xswiftc -warnings-as-errors
+      - name: release_archive_has_no_simulator_symbols
+        run: Scripts/check-release-symbols.sh
 
   thread-sanitizer:
     runs-on: macos-26
@@ -85,3 +87,5 @@ jobs:
         run: Scripts/coverage-gate.sh --targets "PaywallCore PaywallTesting"
       - name: Test under TSan
         run: swift test --sanitize=thread
+      - name: release_archive_has_no_simulator_symbols
+        run: Scripts/check-release-symbols.sh

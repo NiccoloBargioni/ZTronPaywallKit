@@ -99,9 +99,11 @@ struct FailurePathTests {
         let directory = makeTemporaryPaywallDirectory()
         let journal = try Journal(directory: directory, fullSync: false)
         try journal.append(.event(grantEvent("grant:1"), uploaded: false))
-        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: directory.path)
-        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path) }
+        // A directory where the side file goes: open(2) fails with EISDIR, for root too.
+        try FileManager.default.createDirectory(
+            atPath: journal.url.path + Journal.compactingSuffix, withIntermediateDirectories: false)
         #expect(throws: JournalError.self) { try journal.compact() }
+        #expect(try Journal(directory: directory).ledgerEvents.map(\.id) == ["grant:1"])
     }
 
     @Test func journal_sync_failure_is_reported() throws {
@@ -114,7 +116,7 @@ struct FailurePathTests {
         #expect(journal.entries.isEmpty)
     }
 
-    @Test func a_read_only_journal_with_a_torn_tail_fails_to_open() throws {
+    @Test func a_torn_tail_that_cannot_be_truncated_fails_to_open() throws {
         let directory = makeTemporaryPaywallDirectory()
         let journal = try Journal(directory: directory, fullSync: false)
         try journal.append(.event(grantEvent("grant:1"), uploaded: false))
@@ -122,8 +124,8 @@ struct FailurePathTests {
         try handle.seekToEnd()
         try handle.write(contentsOf: Data([9, 9, 9]))
         try handle.close()
-        try FileManager.default.setAttributes([.posixPermissions: 0o400], ofItemAtPath: journal.url.path)
-        #expect(throws: JournalError.self) { try Journal(directory: directory) }
+        #expect(throws: JournalError.self) { try Journal(directory: directory, injecting: .truncate) }
+        #expect(try Journal(directory: directory).droppedTailBytes == 3)
     }
 
     @Test func an_unencodable_event_is_refused_before_any_byte_is_written() throws {
@@ -143,7 +145,7 @@ struct FailurePathTests {
         // Put a non-empty directory where the log was: rename(2) cannot replace it.
         try FileManager.default.removeItem(at: journal.url)
         try FileManager.default.createDirectory(at: journal.url, withIntermediateDirectories: false)
-        FileManager.default.createFile(atPath: journal.url.appendingPathComponent("x").path, contents: Data())
+        _ = FileManager.default.createFile(atPath: journal.url.appendingPathComponent("x").path, contents: Data())
         #expect(throws: JournalError.self) { try journal.compact() }
     }
 
@@ -214,6 +216,16 @@ struct FailurePathTests {
         let snapshot = PaywallFiles.EntitlementSnapshot(entitlement: .unknown, resolvedAt: Date())
         try CanonicalJSON.encoder().encode(snapshot).write(to: directory.appendingPathComponent("entitlement.json"))
         #expect(PaywallFiles(directory: directory).entitlementSnapshot(now: Date()) == nil)
+    }
+
+    @Test func a_lapsed_subscription_snapshot_launches_as_free() {
+        let directory = makeTemporaryPaywallDirectory()
+        let files = PaywallFiles(directory: directory)
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        files.saveEntitlementSnapshot(.subscription(.monthly, expiresAt: now.addingTimeInterval(-1)), at: now.addingTimeInterval(-100))
+        #expect(files.entitlementSnapshot(now: now) == .free)
+        files.saveEntitlementSnapshot(.subscription(.monthly, expiresAt: now.addingTimeInterval(60)), at: now)
+        #expect(files.entitlementSnapshot(now: now)?.isPaying == true)
     }
 
     @Test func audit_sink_with_one_file_rotates_by_truncation() async throws {

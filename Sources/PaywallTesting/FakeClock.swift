@@ -17,14 +17,16 @@ public final class FakeClock: PaywallClock {
     public func advance(by seconds: TimeInterval) {
         now = now.addingTimeInterval(seconds)
         uptime += max(0, seconds)
-        let due = sleepers.filter { $0.until <= now }
-        sleepers.removeAll { $0.until <= now }
-        for sleeper in due { sleeper.continuation.resume() }
+        wakeDueSleepers()
     }
 
     /// Moves the wall clock only (the user changed the time); uptime keeps counting forward.
     public func setWallClock(_ date: Date) {
         now = date
+        wakeDueSleepers()
+    }
+
+    private func wakeDueSleepers() {
         let due = sleepers.filter { $0.until <= now }
         sleepers.removeAll { $0.until <= now }
         for sleeper in due { sleeper.continuation.resume() }

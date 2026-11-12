@@ -51,15 +51,21 @@ public final class Journal {
     private var fd: Int32 = -1
 
     /// Test seam for the crash-safety suite: makes the next writes or syncs fail as a full disk would.
-    enum Fault { case write, sync }
+    enum Fault { case write, sync, truncate }
     var injectedFault: Fault?
 
     /// Opens (creating if needed) the journal in `directory`, drops a torn tail, deletes the partial file of an
     /// interrupted compaction, and compacts when past the threshold.
-    public init(directory: URL, compactionThreshold: Int = 4096, fullSync: Bool = true) throws(JournalError) {
+    public convenience init(directory: URL, compactionThreshold: Int = 4096, fullSync: Bool = true) throws(JournalError) {
+        try self.init(directory: directory, compactionThreshold: compactionThreshold, fullSync: fullSync, injecting: nil)
+    }
+
+    /// The test seam for faults that happen while opening (a torn tail that cannot be truncated).
+    init(directory: URL, compactionThreshold: Int = 4096, fullSync: Bool = true, injecting fault: Fault?) throws(JournalError) {
         self.url = directory.appendingPathComponent(Self.fileName)
         self.compactionThreshold = compactionThreshold
         self.fullSync = fullSync
+        self.injectedFault = fault
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         // An interrupted compaction never renamed its file: the old log wins and the partial file goes.
         try? FileManager.default.removeItem(at: compactingURL)
@@ -85,7 +91,7 @@ public final class Journal {
         droppedTailBytes = data.count - goodLength
         if droppedTailBytes > 0 {
             // A torn tail can only be a partial last write (power loss). Truncate it so the next append is clean.
-            guard truncate(url.path, off_t(goodLength)) == 0 else { throw .writeFailed(errno: errno) }
+            guard injectedFault != .truncate, truncate(url.path, off_t(goodLength)) == 0 else { throw .writeFailed(errno: errno) }
         }
     }
 

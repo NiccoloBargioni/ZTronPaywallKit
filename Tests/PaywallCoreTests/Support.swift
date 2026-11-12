@@ -36,6 +36,7 @@ final class Harness {
     let store: FakeStore
     let clock: FakeClock
     let sync: InMemoryLedgerSync?
+    let connectivity: FakeConnectivity?
     let audit: InMemoryAuditSink
     var settings: GateEngine.Settings
     let grandfathering: GrandfatheringPolicy?
@@ -47,6 +48,7 @@ final class Harness {
         store: FakeStore = FakeStore(products: products),
         clock: FakeClock = FakeClock(),
         sync: InMemoryLedgerSync? = nil,
+        connectivity: FakeConnectivity? = nil,
         audit: InMemoryAuditSink = InMemoryAuditSink(),
         settings: GateEngine.Settings = GateEngine.Settings(tolerance: 300, appVersion: "2.0", build: "200"),
         grandfathering: GrandfatheringPolicy? = nil
@@ -55,12 +57,13 @@ final class Harness {
         self.store = store
         self.clock = clock
         self.sync = sync
+        self.connectivity = connectivity
         self.audit = audit
         self.settings = settings
         self.grandfathering = grandfathering
         self.engine = try GateEngine(
             directory: directory, catalog: catalog, grandfathering: grandfathering, settings: settings, clock: clock,
-            store: store, sync: sync, audit: [audit])
+            store: store, sync: sync, connectivity: connectivity, audit: [audit])
         engine.onEvent = { [weak self] in self?.events.append($0) }
     }
 
@@ -71,11 +74,17 @@ final class Harness {
         engine.shutdown()
         engine = try GateEngine(
             directory: directory, catalog: catalog, grandfathering: grandfathering, settings: settings, clock: clock,
-            store: store, sync: sync, audit: [audit])
+            store: store, sync: sync, connectivity: connectivity, audit: [audit])
         events = []
         engine.onEvent = { [weak self] in self?.events.append($0) }
         if start { await engine.start() }
         return engine
+    }
+
+    /// Every audit record so far, after the trail drained.
+    func records() async -> [AuditRecord] {
+        await engine.flushAudit()
+        return await audit.records
     }
 
     /// A started engine for a free user with `tokens` granted.
