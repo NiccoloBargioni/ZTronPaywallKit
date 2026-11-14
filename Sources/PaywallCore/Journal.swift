@@ -20,6 +20,11 @@ public enum JournalEntry: Codable, Hashable, Sendable {
     case event(LedgerEvent, uploaded: Bool)
     /// The sync carrier acknowledged these event ids. The journal doubles as the outbox.
     case uploaded([String])
+    /// The ledger's derived state at one point of its history. It stands for every event the log held when it was
+    /// written, so compaction can drop them; the ledger starts from the last checkpoint and replays the events after
+    /// it. An event after it that the checkpoint already counts is part of the outbox, kept until the carrier
+    /// acknowledges it, and reloads as a no-op.
+    case checkpoint(LedgerCheckpoint)
 }
 
 public enum JournalError: Error, Hashable, Sendable {
@@ -33,6 +38,10 @@ public enum JournalError: Error, Hashable, Sendable {
 /// appended write-ahead. The single durable authority: leases, the Keychain snapshot and the audit log are
 /// derived from it or repaired from it at launch, never the other way round.
 ///
+/// A compacted log starts with a `.checkpoint`, followed by the events the carrier has not acknowledged yet (which
+/// the checkpoint already counts) and the events appended since. The engine writes the checkpoint; see "Retention"
+/// in the README for when.
+///
 /// Not thread-safe by design: the `@MainActor` engine owns the only instance.
 public final class Journal {
     public static let fileName = "ledger.log"
@@ -41,18 +50,31 @@ public final class Journal {
     public let url: URL
     /// Every entry that survived loading, in file order.
     public private(set) var entries: [JournalEntry] = []
+    /// The `.uploaded` markers among `entries`: what compaction removes. Events stay whatever their number.
+    public private(set) var uploadMarkerCount = 0
+    /// The last `.checkpoint` among `entries`: where the ledger starts from. `nil` for a log that was never
+    /// checkpointed, whose events all replay from genesis.
+    public private(set) var checkpoint: LedgerCheckpoint?
     /// Bytes dropped from a torn tail during the last load.
     public private(set) var droppedTailBytes = 0
-    /// Compact when the log holds more records than this at open.
+    /// Compact at open when the log holds more upload markers than this. Markers, not records: events never leave
+    /// the log at open, so a count of records would rewrite a long history at every launch for nothing. The engine
+    /// uses the same threshold for the events since the last checkpoint when it decides to write a new one.
     public let compactionThreshold: Int
+    /// Whether this open rewrote the log.
+    public private(set) var compactedOnOpen = false
     /// `false` uses `fsync` only, trading power-loss durability for latency (open decision in the design).
     public let fullSync: Bool
 
     private var fd: Int32 = -1
 
-    /// Test seam for the crash-safety suite: makes the next writes or syncs fail as a full disk would.
-    enum Fault { case write, sync, truncate }
+    /// Test seam for the crash-safety suite: makes the next writes or syncs fail as a full disk would. `shortWrite`
+    /// lands half a frame and lets the rewind succeed; `poison` lands half a frame and makes the rewind fail.
+    enum Fault { case write, shortWrite, poison, sync, truncate }
     var injectedFault: Fault?
+    /// Set when a partial frame could not be rewound: the frame boundary is unknown, so nothing more is written
+    /// until a relaunch reloads the file and drops the torn tail. Every write fails closed meanwhile.
+    private(set) var isPoisoned = false
 
     /// Opens (creating if needed) the journal in `directory`, drops a torn tail, deletes the partial file of an
     /// interrupted compaction, and compacts when past the threshold.
@@ -70,7 +92,12 @@ public final class Journal {
         // An interrupted compaction never renamed its file: the old log wins and the partial file goes.
         try? FileManager.default.removeItem(at: compactingURL)
         try load()
-        if entries.count > compactionThreshold { try compact() } else { try openForAppend() }
+        if uploadMarkerCount > compactionThreshold {
+            try compact()
+            compactedOnOpen = true
+        } else {
+            try openForAppend()
+        }
     }
 
     deinit {
@@ -88,10 +115,20 @@ public final class Journal {
         }
         let (decoded, goodLength) = Self.decodeFrames(data)
         entries = decoded
+        for entry in decoded { note(entry) }
         droppedTailBytes = data.count - goodLength
         if droppedTailBytes > 0 {
             // A torn tail can only be a partial last write (power loss). Truncate it so the next append is clean.
             guard injectedFault != .truncate, truncate(url.path, off_t(goodLength)) == 0 else { throw .writeFailed(errno: errno) }
+        }
+    }
+
+    /// Keeps the counts and the checkpoint in step with `entries` as records arrive.
+    private func note(_ entry: JournalEntry) {
+        switch entry {
+        case .uploaded: uploadMarkerCount += 1
+        case .checkpoint(let checkpoint): self.checkpoint = checkpoint
+        case .event: break
         }
     }
 
@@ -148,13 +185,33 @@ public final class Journal {
     public func write(_ entry: JournalEntry) throws(JournalError) {
         try writeFully(fd, Self.frame(entry))
         entries.append(entry)
+        note(entry)
     }
 
     private func writeFully(_ descriptor: Int32, _ bytes: [UInt8]) throws(JournalError) {
-        let written = injectedFault == .write ? -1 : bytes.withUnsafeBytes { buffer in
-            posixWrite(descriptor, buffer.baseAddress, buffer.count)
+        guard !isPoisoned else { throw .writeFailed(errno: EIO) }
+        let end = lseek(descriptor, 0, SEEK_END)
+        let written: Int
+        switch injectedFault {
+        case .write:
+            written = -1
+        case .shortWrite, .poison:
+            written = bytes.withUnsafeBytes { buffer in posixWrite(descriptor, buffer.baseAddress, buffer.count / 2) }
+        case .sync, .truncate, nil:
+            written = bytes.withUnsafeBytes { buffer in posixWrite(descriptor, buffer.baseAddress, buffer.count) }
         }
-        guard written == bytes.count else { throw .writeFailed(errno: errno) }
+        guard written == bytes.count else {
+            let failure = errno
+            // A partial frame left in the middle of the log would hide every record after it from the next load:
+            // rewind to the frame boundary, and if even that fails, stop writing until a relaunch truncates it.
+            if !rewind(descriptor, to: end) { isPoisoned = true }
+            throw .writeFailed(errno: failure)
+        }
+    }
+
+    /// Puts the file end back where it was before a failed write. `false` when the boundary is lost.
+    private func rewind(_ descriptor: Int32, to end: off_t) -> Bool {
+        injectedFault != .poison && end >= 0 && ftruncate(descriptor, end) == 0
     }
 
     /// Step 3: `F_FULLFSYNC` on Apple platforms, because `fsync` alone does not flush the drive's own cache.
@@ -178,6 +235,7 @@ public final class Journal {
         for entry in newEntries { bytes += try Self.frame(entry) }
         try writeFully(fd, bytes)
         entries += newEntries
+        for entry in newEntries { note(entry) }
         try sync()
     }
 
@@ -197,20 +255,49 @@ public final class Journal {
         }
     }
 
+    /// The events the ledger replays on top of `checkpoint`: every event after the last checkpoint, the outbox it
+    /// already counts included (the ledger ignores those by id). Every event, for a log without a checkpoint.
     public var ledgerEvents: [LedgerEvent] {
-        entries.compactMap { entry in
-            if case .event(let event, _) = entry { return event }
-            return nil
+        var events: [LedgerEvent] = []
+        for entry in entries {
+            switch entry {
+            case .event(let event, _): events.append(event)
+            case .uploaded: break
+            case .checkpoint: events.removeAll()
+            }
         }
+        return events
     }
 
     // MARK: Compaction
 
     /// Rewrites the log with the upload markers folded into the events, to a side file that is synced and then
-    /// renamed over the log. A crash before the rename leaves the old log intact.
+    /// renamed over the log. A crash before the rename leaves the old log intact. An existing checkpoint stays in
+    /// front, and the events it counts that the carrier has acknowledged since are dropped.
     public func compact() throws(JournalError) {
+        try rewrite(checkpoint: checkpoint, keepingOutbox: true)
+    }
+
+    /// Rewrites the log behind `checkpoint`: the checkpoint first, then the events it counts that the carrier has
+    /// not acknowledged (the outbox, unless `keepingOutbox` is false because no carrier will ever acknowledge them),
+    /// then every event it does not count, with the upload markers folded in. Same side file and rename as
+    /// `compact()`; an interrupted rewrite leaves the old log intact.
+    public func compact(checkpoint: LedgerCheckpoint, keepingOutbox: Bool) throws(JournalError) {
+        try rewrite(checkpoint: checkpoint, keepingOutbox: keepingOutbox)
+    }
+
+    private func rewrite(checkpoint: LedgerCheckpoint?, keepingOutbox: Bool) throws(JournalError) {
         let pending = Set(pendingUpload.map(\.id))
-        let folded: [JournalEntry] = ledgerEvents.map { .event($0, uploaded: !pending.contains($0.id)) }
+        var folded: [JournalEntry] = []
+        if let checkpoint { folded.append(.checkpoint(checkpoint)) }
+        for entry in entries {
+            // Markers fold into the flag; an older checkpoint is superseded by the one in front.
+            guard case .event(let event, _) = entry else { continue }
+            let acknowledged = !pending.contains(event.id)
+            // An event the checkpoint counts has nothing left to say once the carrier holds it.
+            if let checkpoint, checkpoint.ids.contains(event.id), acknowledged || !keepingOutbox { continue }
+            folded.append(.event(event, uploaded: acknowledged))
+        }
         var bytes: [UInt8] = []
         for entry in folded { bytes += try Self.frame(entry) }
         let side = open(compactingURL.path, O_WRONLY | O_CREAT | O_TRUNC, 0o600)
@@ -234,6 +321,8 @@ public final class Journal {
         }
         guard rename(compactingURL.path, url.path) == 0 else { throw .writeFailed(errno: errno) }
         entries = folded
+        uploadMarkerCount = 0
+        self.checkpoint = checkpoint
         try openForAppend()
     }
 }

@@ -363,8 +363,11 @@ struct GateEngineTests {
         #expect(offline.map(\.displayPrice) == online.map(\.displayPrice))
         #expect(offline.allSatisfy { !$0.isPurchasable && $0.priceAsOf != nil })
 
-        let fresh = try await Harness.free()
+        // Nothing was ever fetched, the launch fetch included: no cache to fall back on.
+        let fresh = try Harness()
         await fresh.store.setNetwork(false)
+        await fresh.start()
+        #expect(fresh.engine.storefront == nil)
         await #expect(throws: FakeStore.Failure.self) { _ = try await fresh.engine.products() }
     }
 
@@ -495,7 +498,9 @@ struct GateEngineTests {
         await engine.flushAudit()
         let records = await sink.records()
         #expect(!records.isEmpty)
-        #expect(await sink.fileURLs().count == 3)
+        let files = await sink.fileURLs().map(\.lastPathComponent)
+        #expect(files.filter { $0.hasSuffix(".jsonl") }.count == 3)
+        #expect(files.contains(JournalSink.anchorFileName))
         #expect(await sink.recordedDebitIDs().count >= 1)
         #expect(await sink.lastRecordHash() == records.last?.hash)
     }

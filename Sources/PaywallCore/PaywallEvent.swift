@@ -58,9 +58,15 @@ public enum PaywallEvent: Hashable, Codable, Sendable {
     case entitlementChanged(from: Entitlement, to: Entitlement, cause: EntitlementChangeCause)
     case purchase(stage: PurchaseStage, productID: String, source: PaywallSource?, transactionID: UInt64?)
     case restore(stage: RestoreStage)
+    /// The user tapped a promoted in-app purchase on the App Store (`PurchaseIntent`, iOS 16.4+). The host opens
+    /// its paywall on `productID`; the engine buys nothing on its own.
+    case purchaseIntent(productID: String)
     case grandfathered(originalAppVersion: String, originalPurchaseDate: Date, environment: StoreEnvironment)
     case storeUnavailable(error: String, snapshotAge: TimeInterval?)
     case syncMerged(count: Int, fromDeviceIDs: [String])
+    /// A storefront fetch changed what the paywall offers, a price or an offer: the products offered now, and the
+    /// storefront's country.
+    case storefrontChanged(productIDs: [String], countryCode: String?)
     /// A debit found in the journal at launch had no `tokensConsumed` record: the audit was rebuilt from it.
     case auditRepaired(debitID: String)
 

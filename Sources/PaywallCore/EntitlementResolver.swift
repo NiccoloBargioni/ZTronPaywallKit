@@ -61,6 +61,16 @@ public struct GrandfatheringPolicy: Hashable, Codable, Sendable {
     }
 }
 
+/// What a transaction another family member bought is worth here. A value on the facade: a build that changes it
+/// applies the new policy at its first resolution, and to the cached snapshot before that.
+public enum FamilySharingPolicy: String, Hashable, Codable, CaseIterable, Sendable {
+    /// Family-shared subscriptions and the lifetime purchase count as paying for every member. Tokens never
+    /// cross members: consumables cannot be shared and the account key is per Apple Account.
+    case sharedEntitlements
+    /// Only transactions this Apple Account bought count; a family-shared one resolves as if absent.
+    case purchaserOnly
+}
+
 /// The result of one resolution.
 public struct EntitlementResolution: Hashable, Sendable {
     public var entitlement: Entitlement
@@ -75,10 +85,12 @@ public struct EntitlementResolution: Hashable, Sendable {
 public struct EntitlementResolver: Sendable {
     public var catalog: ProductCatalog
     public var grandfathering: GrandfatheringPolicy?
+    public var familySharing: FamilySharingPolicy
 
-    public init(catalog: ProductCatalog, grandfathering: GrandfatheringPolicy?) {
+    public init(catalog: ProductCatalog, grandfathering: GrandfatheringPolicy?, familySharing: FamilySharingPolicy = .sharedEntitlements) {
         self.catalog = catalog
         self.grandfathering = grandfathering
+        self.familySharing = familySharing
     }
 
     public func resolve(
@@ -86,9 +98,11 @@ public struct EntitlementResolver: Sendable {
         appTransaction: AppTransactionSnapshot?,
         now: Date
     ) -> EntitlementResolution {
-        // 1. Drop revoked, expired and upgraded transactions. The revocation filter is belt and braces.
+        // 1. Drop revoked, expired and upgraded transactions, and family-shared ones the policy refuses. The
+        //    revocation filter is belt and braces.
         let live = transactions.filter { tx in
             tx.revocationDate == nil && !tx.isUpgraded && (tx.expirationDate.map { $0 > now } ?? true)
+                && (familySharing == .sharedEntitlements || tx.ownership == .purchased)
         }
         let grandfathered = appTransaction.flatMap { snapshot in
             grandfathering?.admits(snapshot) == true ? snapshot : nil
@@ -96,8 +110,10 @@ public struct EntitlementResolver: Sendable {
 
         // 2. The lifetime purchase wins.
         if let lifetime = live.first(where: { $0.productID == catalog.lifetimeProductID }) {
-            return EntitlementResolution(
-                entitlement: .lifetime(.purchase(transactionID: lifetime.id)), grandfathered: grandfathered, expiresAt: nil)
+            let source: LifetimeSource =
+                lifetime.ownership == .familyShared
+                ? .familyShared(transactionID: lifetime.id) : .purchase(transactionID: lifetime.id)
+            return EntitlementResolution(entitlement: .lifetime(source), grandfathered: grandfathered, expiresAt: nil)
         }
         // 2b. A grandfathered lifetime grant ranks with the purchase: it never expires.
         if let grandfathered, grandfathering?.grant == .lifetime {
@@ -116,7 +132,8 @@ public struct EntitlementResolver: Sendable {
                 expiresAt: tx.expirationDate,
                 willAutoRenew: tx.willAutoRenew,
                 isTrial: tx.isIntroductoryOffer,
-                phase: .active
+                phase: .active,
+                isFamilyShared: tx.ownership == .familyShared
             )
             return EntitlementResolution(entitlement: .subscribed(subscription), grandfathered: grandfathered, expiresAt: tx.expirationDate)
         }

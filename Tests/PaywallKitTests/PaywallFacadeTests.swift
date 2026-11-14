@@ -8,7 +8,7 @@ import Testing
 
 let catalog = ProductCatalog(
     subscriptionGroupID: "pro", weekly: "pro.weekly", monthly: "pro.monthly", yearly: "pro.yearly", lifetime: "pro.lifetime",
-    tokenPacks: [TokenPack(productID: "tokens.10", tokens: 10)])
+    tokenPacks: [TokenPack(productID: "tokens.10", tokens: 10), TokenPack(productID: "tokens.50", tokens: 50)])
 
 let products: [PaywallProduct] = [
     PaywallProduct(id: "pro.weekly", kind: .subscription(.weekly), displayName: "Weekly", displayPrice: "€1.99", introOffer: .init(trialDays: 7)),
@@ -16,19 +16,22 @@ let products: [PaywallProduct] = [
     PaywallProduct(id: "pro.yearly", kind: .subscription(.yearly), displayName: "Yearly", displayPrice: "€29.99"),
     PaywallProduct(id: "pro.lifetime", kind: .lifetime, displayName: "Lifetime", displayPrice: "€59.99"),
     PaywallProduct(id: "tokens.10", kind: .tokens(0), displayName: "10 tokens", displayPrice: "€0.99"),
+    PaywallProduct(id: "tokens.50", kind: .tokens(0), displayName: "50 tokens", displayPrice: "€3.99"),
 ]
 
 struct Boom: Error {}
 
-/// A configured, isolated facade (not `shared`) on a fresh directory.
+/// A configured, isolated facade (not `shared`) on a fresh directory. No welcome tokens unless asked: the balance is
+/// what the test grants.
 @MainActor
 func makePaywall(
-    entitlements: [StoreTransaction] = [], tokens: Int = 0, audit: [any PaywallAuditSink] = []
+    entitlements: [StoreTransaction] = [], tokens: Int = 0, audit: [any PaywallAuditSink] = [], welcomeTokens: Int = 0
 ) async -> (Paywall, FakeStore, FakeClock) {
     let paywall = Paywall()
     let store = FakeStore(entitlements: entitlements, products: products)
     let clock = FakeClock()
     var configuration = Paywall.Configuration(catalog: catalog)
+    configuration.welcomeTokens = welcomeTokens
     configuration.store = store
     configuration.clock = clock
     configuration.storageDirectory = makeTemporaryPaywallDirectory()
@@ -216,10 +219,53 @@ struct PaywallFacadeTests {
         #expect(await store.syncCalls == 1)
     }
 
+    /// 2.3.2: a promoted product tapped on the App Store surfaces as a pending intent and on the publisher; starting
+    /// its purchase clears it, so the paywall it opened does not reopen.
+    @Test func purchase_intent_is_pending_until_the_purchase_starts() async throws {
+        let (paywall, store, _) = await makePaywall()
+        var published: [String] = []
+        let cancellable = paywall.purchaseIntents.sink { published.append($0) }
+        await store.deliverPurchaseIntent(productID: "pro.yearly")
+        for _ in 0..<50 where paywall.pendingPurchaseIntent == nil { await settle() }
+        #expect(paywall.pendingPurchaseIntent == "pro.yearly")
+        #expect(published == ["pro.yearly"])
+        // Buying another product leaves the intent pending; buying the promoted one serves it.
+        _ = try await paywall.purchase(products[3])
+        #expect(paywall.pendingPurchaseIntent == "pro.yearly")
+        _ = try await paywall.purchase(products[2])
+        #expect(paywall.pendingPurchaseIntent == nil)
+        await store.deliverPurchaseIntent(productID: "tokens.10")
+        for _ in 0..<50 where paywall.pendingPurchaseIntent == nil { await settle() }
+        #expect(paywall.consumePendingPurchaseIntent() == "tokens.10")
+        #expect(paywall.pendingPurchaseIntent == nil)
+        cancellable.cancel()
+    }
+
+    @Test func family_sharing_is_a_configuration_value_applied_at_resolution() async {
+        let paywall = Paywall()
+        let shared = StoreTransaction.lifetime(id: 5, productID: "pro.lifetime", purchased: Date()).familyShared()
+        var configuration = Paywall.Configuration(catalog: catalog)
+        configuration.store = FakeStore(entitlements: [shared], products: products)
+        configuration.clock = FakeClock()
+        configuration.connectivity = nil
+        configuration.includesDefaultAudit = false
+        configuration.storageDirectory = makeTemporaryPaywallDirectory()
+        configuration.familySharing = .purchaserOnly
+        paywall.configure(configuration)
+        await paywall.waitUntilStarted()
+        #expect(paywall.entitlement == .free)
+        configuration.familySharing = .sharedEntitlements
+        paywall.configure(configuration)
+        await paywall.waitUntilStarted()
+        #expect(paywall.entitlement == .lifetime(.familyShared(transactionID: 5)))
+        #expect(paywall.entitlement.isFamilyShared)
+    }
+
     @Test func reconfigure_tears_down_the_previous_engine() async {
         let (paywall, _, _) = await makePaywall(tokens: 2)
         let first = paywall.engine
         var configuration = Paywall.Configuration(catalog: catalog)
+        configuration.welcomeTokens = 0
         configuration.store = FakeStore()
         configuration.clock = FakeClock()
         configuration.storageDirectory = makeTemporaryPaywallDirectory()
@@ -252,15 +298,21 @@ struct PaywallFacadeTests {
     }
 
     @Test func default_audit_writes_the_journal_and_exports() async throws {
+        let unconfigured = await Paywall().verifyAuditChain()
+        #expect(unconfigured.audit == nil && unconfigured.ledger == nil)
         let paywall = Paywall()
         var configuration = Paywall.Configuration(catalog: catalog)
-        configuration.store = FakeStore(products: products)
+        let signed = AppTransactionSnapshot(
+            bundleID: "b", originalAppVersion: "200", originalPurchaseDate: Date(), environment: .production,
+            origin: .appTransaction, signedPayload: Data("jws".utf8))
+        configuration.store = FakeStore(app: signed, products: products)
         configuration.clock = FakeClock()
         configuration.storageDirectory = makeTemporaryPaywallDirectory()
         paywall.configure(configuration)
         await paywall.waitUntilStarted()
         paywall.grant(tokens: 5, reason: "t")
         _ = paywall.run(.tokens(1), source: PaywallSource(id: "g", fileID: "f", function: "g", line: 1), scope: nil, holder: nil) {}
+        _ = paywall.run(.tokens(1), source: PaywallSource(id: "h", fileID: "f", function: "g", line: 2), scope: nil, holder: nil) {}
         let chain = await paywall.verifyAuditChain()
         #expect(chain.audit == nil && chain.ledger == nil)
         let zip = try await paywall.exportAudit()
@@ -273,6 +325,19 @@ struct PaywallFacadeTests {
 @Suite("Disclosure and signals")
 @MainActor
 struct DisclosureTests {
+    /// 2.1(b): the catalog the tests use, the `.storekit` file the simulator and host lanes load, and App Store
+    /// Connect describe the same products. The group id in StoreKit is App Store Connect's numeric id, so the
+    /// catalog's `subscriptionGroupID` is compared through the group that holds the tiers, not by name.
+    @Test func the_storekit_configuration_matches_the_test_catalog() throws {
+        let url = try #require(Bundle.module.url(forResource: "Paywall", withExtension: "storekit", subdirectory: "Fixtures"))
+        let file = try Data(contentsOf: url)
+        #expect(try catalog.mismatches(withStoreKitConfiguration: file).isEmpty)
+        let drifted = ProductCatalog(subscriptionGroupID: "pro", weekly: "pro.weekly", lifetime: "pro.lifetime", tokenPacks: [TokenPack(productID: "tokens.5", tokens: 5)])
+        let problems = try drifted.mismatches(withStoreKitConfiguration: file)
+        #expect(problems.contains(.missingFromConfiguration(productID: "tokens.5")))
+        #expect(problems.contains(.missingFromCatalog(productID: "pro.monthly")))
+    }
+
     let terms = URL(string: "https://example.com/terms")!
     let privacy = URL(string: "https://example.com/privacy")!
 

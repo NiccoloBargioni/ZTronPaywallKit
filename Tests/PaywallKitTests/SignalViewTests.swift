@@ -13,6 +13,7 @@
     private final class Recorder: ObservableObject {
         var presented: [String] = []
         var handled: [String] = []
+        var entitlements: [Entitlement?] = []
         @Published var phase: ScenePhase = .background
     }
 
@@ -44,10 +45,78 @@
         }
     }
 
+    /// Reads `\.paywallEntitlement` where it lives and records every value it sees.
+    @available(macOS 14, *)
+    private struct EntitlementProbe: View {
+        @ObservedObject var recorder: Recorder
+        @Environment(\.paywallEntitlement) private var entitlement
+        var body: some View {
+            Text("probe")
+                .onAppear { recorder.entitlements.append(entitlement) }
+                .onChange(of: entitlement) { _, new in recorder.entitlements.append(new) }
+        }
+    }
+
     @Suite("Signal modifiers", .serialized)
     @MainActor
     struct SignalViewTests {
-        @Test func paywall_sheet_presents_unclaimed_failures() async {
+        /// `\.paywallEntitlement` is nil until the first resolution answers, then follows `Paywall.entitlement`
+        /// through every change, from the root the sheet is installed on.
+        @available(macOS 14, *)
+        @Test func paywall_entitlement_is_nil_until_resolved_then_follows_the_facade() async {
+            let paywall = Paywall()
+            let recorder = Recorder()
+            let window = await Paywall.$override.withValue(paywall) {
+                await host(EntitlementProbe(recorder: recorder).paywallSheet { _ in Text("paywall") })
+            }
+            defer { window.close() }
+            #expect(paywall.entitlement == .unknown)
+            #expect(recorder.entitlements == [nil], "\(recorder.entitlements)")
+
+            let store = FakeStore(entitlements: [.lifetime(id: 7, productID: "pro.lifetime", purchased: Date())], products: products)
+            var configuration = Paywall.Configuration(catalog: catalog)
+            configuration.store = store
+            configuration.clock = FakeClock()
+            configuration.storageDirectory = makeTemporaryPaywallDirectory()
+            configuration.includesDefaultAudit = false
+            configuration.connectivity = nil
+            paywall.configure(configuration)
+            await paywall.waitUntilStarted()
+            await pump(window)
+            #expect(recorder.entitlements.last == .lifetime(.purchase(transactionID: 7)), "\(recorder.entitlements)")
+
+            await store.refund(7, at: Date())
+            await settle()
+            await pump(window)
+            #expect(recorder.entitlements.last == .free, "\(recorder.entitlements)")
+            #expect(!recorder.entitlements.contains(.unknown), "unknown must read as nil, never as a value")
+        }
+
+        @available(macOS 14, *)
+        @Test func paywall_lifecycle_injects_the_entitlement_too() async {
+            let (paywall, _, _) = await makePaywall()
+            let recorder = Recorder()
+            let window = await Paywall.$override.withValue(paywall) {
+                await host(EntitlementProbe(recorder: recorder).paywallLifecycle())
+            }
+            defer { window.close() }
+            #expect(recorder.entitlements.last == .free, "\(recorder.entitlements)")
+        }
+
+        /// Without a root modifier nothing injects it: the default is nil whatever the facade knows.
+        @available(macOS 14, *)
+        @Test func without_a_root_modifier_the_entitlement_environment_is_nil() async {
+            let (paywall, _, _) = await makePaywall()
+            let recorder = Recorder()
+            let window = await Paywall.$override.withValue(paywall) {
+                await host(EntitlementProbe(recorder: recorder))
+            }
+            defer { window.close() }
+            #expect(paywall.entitlement == .free)
+            #expect(recorder.entitlements == [nil], "\(recorder.entitlements)")
+        }
+
+        @Test func paywall_sheet_presents_unclaimed_failures_and_consumes_them() async {
             let (paywall, _, _) = await makePaywall()
             let recorder = Recorder()
             let window = await Paywall.$override.withValue(paywall) {
@@ -59,10 +128,49 @@
             defer { window.close() }
             _ = paywall.evaluate(.paid, id: "heatmap")
             await settle()
-            #expect(paywall.pendingFailure?.source.id == "heatmap")
             await pump(window)
             #expect(recorder.presented == ["heatmap"])
+            // The presenter took it: nothing is left for a second presenter, and a later denial is a new sheet.
+            #expect(paywall.pendingFailure == nil)
             window.attachedSheet.map { window.endSheet($0) }
+        }
+
+        /// The design's rule: `pendingFailure` is consumed by the first presenter, so two installed sheets cannot
+        /// both show one denial.
+        @Test func two_installed_sheets_present_a_denial_once() async {
+            let (paywall, _, _) = await makePaywall()
+            let recorder = Recorder()
+            let window = await Paywall.$override.withValue(paywall) {
+                await host(
+                    Text("root")
+                        .paywallSheet { failure in
+                            Text("outer").onAppear { recorder.presented.append("outer:\(failure.source.id)") }
+                        }
+                        .paywallSheet { failure in
+                            Text("inner").onAppear { recorder.presented.append("inner:\(failure.source.id)") }
+                        })
+            }
+            defer { window.close() }
+            _ = paywall.evaluate(.paid, id: "heatmap")
+            await settle()
+            await pump(window)
+            await pump(window)
+            #expect(recorder.presented.count == 1, "\(recorder.presented)")
+            #expect(paywall.pendingFailure == nil)
+            window.attachedSheet.map { window.endSheet($0) }
+        }
+
+        @Test func on_purchase_intent_opens_the_paywall_on_the_promoted_product() async {
+            let (paywall, store, _) = await makePaywall()
+            let recorder = Recorder()
+            let window = await Paywall.$override.withValue(paywall) {
+                await host(Text("root").onPurchaseIntent { recorder.handled.append($0) })
+            }
+            defer { window.close() }
+            await store.deliverPurchaseIntent(productID: "pro.yearly")
+            for _ in 0..<50 where recorder.handled.isEmpty { await pump(window) }
+            #expect(recorder.handled == ["pro.yearly"])
+            #expect(paywall.pendingPurchaseIntent == nil)  // taken by the handler
         }
 
         @Test func paywall_sheet_can_be_switched_off() async {

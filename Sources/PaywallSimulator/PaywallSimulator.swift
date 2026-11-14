@@ -76,6 +76,8 @@
             configuration.grandfathering = self.grandfathering
             configuration.tolerance = simulation.tolerance ?? configuration.tolerance
             configuration.includesDefaultAudit = true
+            // The `tokens` switch is the balance: no welcome grant on top of it.
+            configuration.welcomeTokens = 0
             let store = store
             let connectivity = connectivity
             let snapshot = storeState(for: simulation)
@@ -110,7 +112,11 @@
                 setQuietly(\.entitlement, .free)
                 Task { await store.refund(Self.subscriptionTransactionID, at: now) }
             case .lifetime:
-                guard case .lifetime(.purchase(let id)) = simulation.entitlement else { return }
+                let id: UInt64
+                switch simulation.entitlement {
+                case .lifetime(.purchase(let purchased)), .lifetime(.familyShared(let purchased)): id = purchased
+                default: return
+                }
                 setQuietly(\.entitlement, .free)
                 Task { await store.refund(id, at: now) }
             case .lastTokenPack:
@@ -247,6 +253,8 @@
                 phase = subscription.phase
             case .lifetime(.purchase(let id)):
                 entitlements = [.lifetime(id: id, productID: catalog?.lifetimeProductID ?? "pro.lifetime", purchased: now)]
+            case .lifetime(.familyShared(let id)):
+                entitlements = [.lifetime(id: id, productID: catalog?.lifetimeProductID ?? "pro.lifetime", purchased: now).familyShared()]
             case .lifetime(.grandfathered):
                 let policy = grandfathering ?? Self.simulatedPolicy
                 app = AppTransactionSnapshot(
@@ -281,23 +289,45 @@
             await store.setProducts(state.products)
         }
 
+        /// Euro prices in cents: the display string and the exact figure behind it.
+        static func money(_ cents: Int) -> (display: String, price: Decimal) {
+            ("€\(cents / 100).\(String(format: "%02d", cents % 100))", Decimal(cents) / 100)
+        }
+
+        static func cents(for tier: SubscriptionTier) -> Int {
+            switch tier {
+            case .weekly: return 199
+            case .monthly: return 499
+            case .yearly: return 2_999
+            }
+        }
+
+        /// The simulated storefront: every catalog product, priced in euros, each plan with a seven-day free trial
+        /// the `introOfferEligible` switch decides the eligibility of.
         static func products(for catalog: ProductCatalog?, introEligible: Bool) -> [PaywallProduct] {
             guard let catalog else { return [] }
             var products: [PaywallProduct] = []
-            let prices: [SubscriptionTier: String] = [.weekly: "€1.99", .monthly: "€4.99", .yearly: "€29.99"]
             for tier in SubscriptionTier.allCases {
                 guard let id = catalog.subscriptions[tier] else { continue }
+                let (display, price) = money(cents(for: tier))
+                let trial = PaywallProduct.Offer(
+                    kind: .introductory, paymentMode: .freeTrial, displayPrice: "€0.00", price: 0, periodDays: 7, isEligible: introEligible)
                 products.append(
                     PaywallProduct(
-                        id: id, kind: .subscription(tier), displayName: "Pro \(tier.rawValue.capitalized)",
-                        displayPrice: prices[tier] ?? "€0.99", introOffer: introEligible ? .init(trialDays: 7) : nil))
+                        id: id, kind: .subscription(tier), displayName: "Pro \(tier.rawValue.capitalized)", displayPrice: display,
+                        price: price, currencyCode: "EUR", introOffer: introEligible ? .init(trialDays: 7) : nil, offers: [trial]))
             }
             if let lifetime = catalog.lifetimeProductID {
-                products.append(PaywallProduct(id: lifetime, kind: .lifetime, displayName: "Pro Lifetime", displayPrice: "€59.99"))
+                let (display, price) = money(5_999)
+                products.append(
+                    PaywallProduct(id: lifetime, kind: .lifetime, displayName: "Pro Lifetime", displayPrice: display, price: price, currencyCode: "EUR"))
             }
             for pack in catalog.tokenPacks {
+                let (display, price) = money(pack.tokens / 10 * 100 + 99)
                 products.append(
-                    PaywallProduct(id: pack.productID, kind: .tokens(pack.tokens), displayName: "\(pack.tokens) tokens", displayPrice: "€\(pack.tokens / 10).99"))
+                    PaywallProduct(
+                        id: pack.productID, kind: .tokens(pack.tokens), displayName: "\(pack.tokens) tokens", displayPrice: display,
+                        price: price, currencyCode: "EUR"))
             }
             return products
         }
@@ -334,7 +364,8 @@
     }
 
     extension View {
-        /// For `#Preview`: configures `Paywall.shared` with `simulation` before the content first appears, so
+        /// For `#Preview`: configures `Paywall.shared` with `simulation` before the content first appears, through a
+        /// `PaywallServiceProvider` the content finds in its environment as it would under the app's root, so
         /// `PaywallSimulation(.free)` renders the denied state and `PaywallSimulation(.lifetime)` the open one.
         public func paywallSimulation(_ simulation: PaywallSimulation, catalog: ProductCatalog = .simulatorDefault) -> some View {
             modifier(PaywallSimulationModifier(simulation: simulation, catalog: catalog))
@@ -343,10 +374,13 @@
 
     @MainActor
     final class PaywallPreviewHost: ObservableObject {
+        /// The fake on the shared facade, installed on the preview as an app's root would.
+        let provider: PaywallServiceProvider
+
         init(simulation: PaywallSimulation, catalog: ProductCatalog) {
-            Paywall.shared.configure(.simulated(simulation, catalog: catalog))
+            provider = PaywallServiceProvider(.simulated(simulation, catalog: catalog))
             // Seed synchronously so the first frame is right; the store resolution confirms it.
-            if let engine = Paywall.shared.engine {
+            if let engine = provider.paywall.engine {
                 engine.simulateBalance(simulation.tokens)
                 engine.simulateEntitlement(simulation.storeReachable ? simulation.entitlement : .unknown)
             }
@@ -361,7 +395,7 @@
         }
 
         func body(content: Content) -> some View {
-            content.environmentObject(Paywall.shared)
+            content.paywallProvider(host.provider)
         }
     }
 #endif

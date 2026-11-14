@@ -12,12 +12,16 @@
         let presence: AnyPublisher<Bool, Never>
         let presentsPaywall: Bool
         let sheet: ((PaywallFailure) -> AnyView)?
+        /// The facade in effect where the controller was built (`Paywall.shared` outside tests).
+        @ObservedObject private var paywall = Paywall.active
 
         public var body: some View {
             let hosted = content
                 .environment(\.paywallGate, session)
                 .environment(\.paywallPresence, presence)
-                .environmentObject(Paywall.shared)
+                .environment(\.paywallEntitlement, paywall.entitlement.resolved)
+                .environmentObject(paywall)
+                .modifier(PaywallProviderReinjection(provider: paywall.provider))
             if presentsPaywall, let sheet {
                 hosted.paywallSheet { failure in sheet(failure) }
             } else {
@@ -26,10 +30,25 @@
         }
     }
 
-    /// The only UIKit bridge: re-injects `Paywall.shared` and the `GateSession` it is given, publishes presence
-    /// from `willMove(toParent:)` and the appearance callbacks (so a reservation held by a hosted gated view is
-    /// released when UIKit drops the controller, even on cell reuse where `onDisappear` may not fire), and
-    /// installs its own `.paywallSheet` when `presentsPaywall` is true.
+    /// Puts the app's `PaywallServiceProvider` back under a UIKit layer, when the app installed one.
+    struct PaywallProviderReinjection: ViewModifier {
+        let provider: PaywallServiceProvider?
+
+        @ViewBuilder
+        func body(content: Content) -> some View {
+            if let provider {
+                content.environmentObject(provider)
+            } else {
+                content
+            }
+        }
+    }
+
+    /// The only UIKit bridge: re-injects `Paywall.shared` (and the `PaywallServiceProvider` that configured it, when
+    /// the app installed one) and the `GateSession` it is given, publishes presence from `willMove(toParent:)` and
+    /// the appearance callbacks (so a reservation held by a hosted gated view is released when UIKit drops the
+    /// controller, even on cell reuse where `onDisappear` may not fire), and installs its own `.paywallSheet` when
+    /// `presentsPaywall` is true.
     public final class PaywallHostingController<Content: View>: UIHostingController<PaywallHostedRoot<Content>> {
         private let presenceSubject = CurrentValueSubject<Bool, Never>(false)
 

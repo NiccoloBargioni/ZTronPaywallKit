@@ -3,7 +3,9 @@ public import PaywallCore
 
 /// The recommended carrier: ledger events in the CloudKit private database (the truth across devices, union
 /// merge, no conflicts because events are immutable) plus the Keychain snapshot (the fast path after a
-/// reinstall). Reservations and leases never sync.
+/// reinstall). Reservations and leases never sync. A device with no iCloud account is answered with nothing
+/// rather than an error (`CloudDatabaseError.noAccount`): the engine then settles the welcome grant on its own,
+/// and the next sync asks again, so signing in is picked up.
 ///
 /// ```swift
 /// var configuration = Paywall.Configuration(catalog: catalog)
@@ -33,14 +35,11 @@ public actor PaywallCloudSync: LedgerSync {
     }
 
     /// CloudKit in `containerIdentifier` (or the default container), with the change token stored next to the
-    /// journal in Application Support.
-    public init(containerIdentifier: String? = nil, keychain: KeychainWalletSnapshotStore? = KeychainWalletSnapshotStore()) {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? FileManager.default.temporaryDirectory
-        self.init(
-            database: CloudKitDatabase(containerIdentifier: containerIdentifier), keychain: keychain,
-            tokenURL: base.appendingPathComponent("ztron.paywall/cloudkit.token"))
-    }
+    /// journal in Application Support. Entitled hosts only: see `CloudKitDatabase.init(containerIdentifier:)`.
+    public init(containerIdentifier: String? = nil, keychain: KeychainWalletSnapshotStore? = KeychainWalletSnapshotStore()) { self.init(database: CloudKitDatabase(containerIdentifier: containerIdentifier), keychain: keychain, tokenURL: Self.defaultTokenURL) }
+
+    /// `Application Support/ztron.paywall/cloudkit.token`, next to the journal.
+    public static var defaultTokenURL: URL { let base: URL; if let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first { base = support } else { base = FileManager.default.temporaryDirectory }; return base.appendingPathComponent("ztron.paywall/cloudkit.token") }
 
     public func push(_ events: [LedgerEvent]) async throws -> Set<String> {
         let records = try events.map(CloudLedgerRecord.init)
@@ -49,15 +48,22 @@ public actor PaywallCloudSync: LedgerSync {
 
     public func pull() async throws -> [LedgerEvent] {
         if !pullRequested, let lastPull, Date().timeIntervalSince(lastPull) < minimumPullInterval { return [] }
-        let (records, token) = try await database.fetchChanges(since: changeToken)
-        changeToken = token
-        if let tokenURL, let token {
+        let page: (records: [CloudLedgerRecord], token: Data?)
+        do {
+            page = try await database.fetchChanges(since: changeToken)
+        } catch CloudDatabaseError.noAccount {
+            // Nothing of this account exists anywhere for this device to take: the pull has answered, with nothing.
+            // Neither the interval nor the token moves, so the next sync asks again.
+            return []
+        }
+        changeToken = page.token
+        if let tokenURL, let token = page.token {
             try? FileManager.default.createDirectory(at: tokenURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             try? token.write(to: tokenURL, options: .atomic)
         }
         lastPull = Date()
         pullRequested = false
-        return records.compactMap { try? $0.event() }
+        return page.records.compactMap { try? $0.event() }
     }
 
     public func requestPull() async { pullRequested = true }

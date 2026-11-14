@@ -10,6 +10,11 @@ public struct StoreTransaction: Hashable, Codable, Sendable {
         case autoRenewable, nonConsumable, consumable, nonRenewable
     }
 
+    /// `Transaction.ownershipType`: bought by this Apple Account, or shared by a family member.
+    public enum Ownership: String, Hashable, Codable, Sendable {
+        case purchased, familyShared
+    }
+
     public var id: UInt64
     public var originalID: UInt64
     public var productID: String
@@ -22,6 +27,7 @@ public struct StoreTransaction: Hashable, Codable, Sendable {
     public var isIntroductoryOffer: Bool
     public var willAutoRenew: Bool
     public var subscriptionGroupID: String?
+    public var ownership: Ownership
 
     public init(
         id: UInt64,
@@ -34,7 +40,8 @@ public struct StoreTransaction: Hashable, Codable, Sendable {
         isUpgraded: Bool = false,
         isIntroductoryOffer: Bool = false,
         willAutoRenew: Bool = true,
-        subscriptionGroupID: String? = nil
+        subscriptionGroupID: String? = nil,
+        ownership: Ownership = .purchased
     ) {
         self.id = id
         self.originalID = originalID ?? id
@@ -47,6 +54,7 @@ public struct StoreTransaction: Hashable, Codable, Sendable {
         self.isIntroductoryOffer = isIntroductoryOffer
         self.willAutoRenew = willAutoRenew
         self.subscriptionGroupID = subscriptionGroupID
+        self.ownership = ownership
     }
 }
 
@@ -116,6 +124,9 @@ public protocol StoreClient: Sendable {
     func appTransaction() async throws -> AppTransactionSnapshot?
     /// `Transaction.updates`, verified results only. One stream per call; it is live when this returns.
     func updates() async -> AsyncStream<StoreTransaction>
+    /// `PurchaseIntent.intents` (iOS 16.4+): the product ids of promoted in-app purchases the user tapped on the
+    /// App Store. Empty and finished where the OS has no such API. One stream per call.
+    func purchaseIntents() async -> AsyncStream<String>
     func products(for ids: Set<String>) async throws -> [PaywallProduct]
     func purchase(productID: String) async throws -> StorePurchaseResult
     /// `AppStore.sync()`. Can prompt for sign-in: user-initiated only.
@@ -125,4 +136,6 @@ public protocol StoreClient: Sendable {
     /// `Product.SubscriptionInfo.Status` for the group. Goes to the App Store: account screen only.
     func subscriptionPhase(groupID: String) async throws -> SubscriptionPhase?
     func isEligibleForIntroOffer(groupID: String) async -> Bool
+    /// `Storefront.current?.countryCode`: the country the prices and offers are for. `nil` where the store cannot say.
+    func storefrontCountryCode() async -> String?
 }

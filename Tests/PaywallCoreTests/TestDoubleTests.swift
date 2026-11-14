@@ -32,6 +32,11 @@ struct TestDoubleTests {
         await store.setIntroEligible(false)
         #expect(try await store.subscriptionPhase(groupID: "pro") == .inGracePeriod)
         #expect(await !store.isEligibleForIntroOffer(groupID: "pro"))
+        #expect(await store.storefrontCountryCode() == "USA")
+        await store.setStorefrontCountry(nil)
+        #expect(await store.storefrontCountryCode() == nil)
+        #expect(try await store.products(for: ["tokens.10"]).map(\.id) == ["tokens.10"])
+        #expect(await store.productCalls == 1)
         guard case .success(let bought) = try await store.purchase(productID: "pro.monthly") else {
             Issue.record("expected a purchase")
             return
@@ -67,5 +72,11 @@ struct TestDoubleTests {
         cancelled.cancel()
         await #expect(throws: CancellationError.self) { try await cancelled.value }
         try await clock.sleep(until: start)  // a deadline in the past returns at once
+
+        // Cancelled before it ever ran: the continuation is resumed throwing as it is enqueued, nothing is left behind.
+        let stillborn = Task { try await clock.sleep(until: clock.now.addingTimeInterval(10)) }
+        stillborn.cancel()
+        await #expect(throws: CancellationError.self) { try await stillborn.value }
+        #expect(clock.pendingSleepers == 0)
     }
 }

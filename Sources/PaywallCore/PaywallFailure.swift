@@ -103,5 +103,29 @@ public enum PaywallOutcome<Success> {
     }
 }
 
+/// Pipeline-style handling: each call runs its closure when the outcome matches and returns the outcome unchanged,
+/// so the calls chain off `withPaywall` and `evaluate` directly. The closures run synchronously, in the caller's
+/// isolation. A closed gate is published whether or not `onBlocked` runs, so call `failure.claim()` from it when
+/// you present the denial yourself, or the `.paywallSheet` shows it too.
+///
+///     withPaywall(.tokens(2), id: "export") { exportPDF() }
+///         .onExecuted { url in share(url) }
+///         .onBlocked { failure in failure.claim(); showUpsell(failure) }
+extension PaywallOutcome {
+    /// Calls `body` with the value when the gate opened and the body ran.
+    @discardableResult
+    public func onExecuted(_ body: (Success) throws -> Void) rethrows -> Self {
+        if case .executed(let value) = self { try body(value) }
+        return self
+    }
+
+    /// Calls `body` with the failure when the gate was closed.
+    @discardableResult
+    public func onBlocked(_ body: (PaywallFailure) throws -> Void) rethrows -> Self {
+        if case .blocked(let failure) = self { try body(failure) }
+        return self
+    }
+}
+
 extension PaywallOutcome: Sendable where Success: Sendable {}
 extension PaywallOutcome: Equatable where Success: Equatable {}

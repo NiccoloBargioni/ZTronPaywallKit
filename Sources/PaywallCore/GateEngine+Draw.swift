@@ -66,10 +66,6 @@ extension GateEngine {
     public func begin(_ level: GateLevel, source: PaywallSource, scope: String? = nil, holder: UUID? = nil) -> GateBegin {
         let gateID = source.id
         reportExpiredLease(gateID)
-        if let holder, var session = sessions[holder] {
-            session.committed = true
-            sessions[holder] = session
-        }
         // A view-held reservation for this gate is what a commit spends, so it does not count against itself.
         let consumed = reservations.reservation(forGate: gateID, preferring: holder)
         switch decide(level, gateID: gateID, excluding: consumed?.holder ?? holder) {
@@ -81,6 +77,7 @@ extension GateEngine {
         case .open(.affordable(let n)):
             switch draw(n, source: source, consuming: consumed, pinning: consumed?.holder ?? holder) {
             case .success(let ticket):
+                markCommitted(holder)
                 emit(.gateEvaluated(source: source, level: level, decision: .open(.drawn(n))))
                 emit(.gateOpened(source: source, level: level, mode: .drawn(n)))
                 return .open(ticket)
@@ -90,6 +87,7 @@ extension GateEngine {
                 return .blocked(failure)
             }
         case .open(let mode):
+            markCommitted(holder)
             if mode == .leased {
                 if let holder { pin(gateID, holder: holder) }
                 if settings.leasePolicy == .refreshOnReentry { extendLease(gateID) }
@@ -99,6 +97,14 @@ extension GateEngine {
             return .open(
                 GateTicket(level: level, source: source, mode: mode, debitID: nil, tokens: 0, leaseUntil: nil, holder: holder))
         }
+    }
+
+    /// A view's session committed through this gate: it did what `.reserve` content is for. Only an open gate
+    /// counts; a denied commit leaves `reservedWithoutCommit` to fire if the view leaves.
+    private func markCommitted(_ holder: UUID?) {
+        guard let holder, var session = sessions[holder] else { return }
+        session.committed = true
+        sessions[holder] = session
     }
 
     /// Steps 1–3 of the write-ahead order. On success the debit is durable and the lease exists (it *is* the

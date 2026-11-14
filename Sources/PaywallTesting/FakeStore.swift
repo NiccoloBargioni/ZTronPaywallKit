@@ -15,6 +15,10 @@ public actor FakeStore: StoreClient {
     public var nextPurchase: NextPurchase = .succeed
     public var phase: SubscriptionPhase?
     public var introEligible = true
+    /// `Storefront.current?.countryCode`: the fake sells in the US unless told otherwise.
+    public var storefrontCountry: String? = "USA"
+    /// `products(for:)` calls, so a test can assert when the storefront was fetched.
+    public private(set) var productCalls = 0
     /// Transactions the engine has `finish()`ed, in order.
     public private(set) var finished: [UInt64] = []
     public private(set) var syncCalls = 0
@@ -24,6 +28,7 @@ public actor FakeStore: StoreClient {
     public enum NextPurchase: Hashable, Sendable { case succeed, pending, cancel, fail }
 
     private var listeners: [UUID: AsyncStream<StoreTransaction>.Continuation] = [:]
+    private var intentListeners: [UUID: AsyncStream<String>.Continuation] = [:]
 
     public init(
         entitlements: [StoreTransaction] = [],
@@ -40,8 +45,10 @@ public actor FakeStore: StoreClient {
     }
 
     private func removeListener(_ id: UUID) { listeners[id] = nil }
+    private func removeIntentListener(_ id: UUID) { intentListeners[id] = nil }
 
     public var listenerCount: Int { listeners.count }
+    public var intentListenerCount: Int { intentListeners.count }
 
     // MARK: Scripting
 
@@ -53,6 +60,7 @@ public actor FakeStore: StoreClient {
     public func setProducts(_ products: [PaywallProduct]) { catalogProducts = products }
     public func setPhase(_ phase: SubscriptionPhase?) { self.phase = phase }
     public func setIntroEligible(_ eligible: Bool) { introEligible = eligible }
+    public func setStorefrontCountry(_ code: String?) { storefrontCountry = code }
     public func addToHistory(_ transaction: StoreTransaction) { history.append(transaction) }
 
     public func makeTransactionID() -> UInt64 {
@@ -66,6 +74,11 @@ public actor FakeStore: StoreClient {
         history.removeAll { $0.id == transaction.id }
         history.append(transaction)
         broadcast(transaction)
+    }
+
+    /// The user tapped a promoted in-app purchase on the App Store: delivers the product id on `purchaseIntents()`.
+    public func deliverPurchaseIntent(productID: String) {
+        for continuation in intentListeners.values { continuation.yield(productID) }
     }
 
     /// Refunds `transactionID`: removes it from current entitlements, marks it revoked in history, and delivers
@@ -107,10 +120,23 @@ public actor FakeStore: StoreClient {
         return stream
     }
 
+    public func purchaseIntents() async -> AsyncStream<String> {
+        let id = UUID()
+        let (stream, continuation) = AsyncStream<String>.makeStream()
+        continuation.onTermination = { [weak self] _ in
+            Task { await self?.removeIntentListener(id) }
+        }
+        intentListeners[id] = continuation
+        return stream
+    }
+
     public func products(for ids: Set<String>) async throws -> [PaywallProduct] {
+        productCalls += 1
         guard hasNetwork, isReachable else { throw Failure.network }
         return catalogProducts.filter { ids.contains($0.id) }
     }
+
+    public func storefrontCountryCode() async -> String? { storefrontCountry }
 
     public func purchase(productID: String) async throws -> StorePurchaseResult {
         purchaseCalls += 1
@@ -166,6 +192,13 @@ extension StoreTransaction {
 
     public static func lifetime(id: UInt64, productID: String, purchased: Date) -> StoreTransaction {
         StoreTransaction(id: id, productID: productID, productType: .nonConsumable, purchaseDate: purchased)
+    }
+
+    /// The same transaction as another family member's device reports it: shared, not bought here.
+    public func familyShared() -> StoreTransaction {
+        var shared = self
+        shared.ownership = .familyShared
+        return shared
     }
 
     public static func tokenPack(id: UInt64, productID: String, purchased: Date, revoked: Date? = nil) -> StoreTransaction {

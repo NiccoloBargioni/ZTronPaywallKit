@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 
+env:
+  SIMULATOR: platform=iOS Simulator,name=iPhone 16 Pro
+
 jobs:
   # Concurrency requirement 3 and 6: no allowlist, the first occurrence fails the job.
   forbidden-constructs:
@@ -18,7 +21,7 @@ jobs:
       - name: Reject unsafe concurrency escapes and manual threading
         run: |
           pattern='@unchecked[[:space:]]+Sendable|nonisolated\(unsafe\)|@preconcurrency|DispatchQueue|DispatchSemaphore|OperationQueue|NSLock|NSRecursiveLock|os_unfair_lock|pthread_mutex|Thread\.(detach|sleep)|[^A-Za-z]Thread\('
-          if grep -rnE "$pattern" Sources Tests; then
+          if grep -rnE "$pattern" Sources Tests TestHost; then
             echo "::error::forbidden construct found (see the design's concurrency requirements)"
             exit 1
           fi
@@ -29,6 +32,8 @@ jobs:
             exit 1
           fi
 
+  # One job holds every coverage source, because the gate is per target and PaywallKit's StoreKit adapter is only
+  # exercised in the hosted simulator lane: `swift test` (llvm-cov) plus two `xcodebuild test` runs (xccov).
   macos:
     runs-on: macos-26
     steps:
@@ -37,14 +42,50 @@ jobs:
         run: sudo xcode-select -s /Applications/Xcode_26.app
       - name: Build with zero warnings
         run: swift build --build-tests -Xswiftc -warnings-as-errors
-      - name: Test with coverage
+      - name: Test with coverage (macOS)
         run: swift test --enable-code-coverage
-      - name: Coverage gate (97 % per target, 100 % on crash-critical files)
-        run: Scripts/coverage-gate.sh --baseline coverage-baseline.json
+      # SWIFT_TREAT_WARNINGS_AS_ERRORS is not set on the xcodebuild lanes: Xcode rejects it next to swift-log's own
+      # -suppress-warnings. Zero warnings in this package's code is enforced by the swift build above.
+      - name: Package tests on the iOS Simulator (UIKit boundaries, draw performance, every suite)
+        run: |
+          xcodebuild test \
+            -scheme ztron-paywall-kit-Package \
+            -destination "$SIMULATOR" \
+            -skipPackagePluginValidation \
+            -enableCodeCoverage YES \
+            -resultBundlePath "$RUNNER_TEMP/package.xcresult"
+          xcrun xccov view --report --json "$RUNNER_TEMP/package.xcresult" > "$RUNNER_TEMP/package-xccov.json"
+      # LiveCloudKitTests (the live CloudKit lane) is in this bundle too, gated on PAYWALL_CLOUDKIT_CONTAINER: it needs
+      # a simulator signed into an iCloud account and a signed host, which no runner has, so it is skipped here
+      # and run locally (README, "Live CloudKit lane"). CODE_SIGNING_ALLOWED=NO leaves the iCloud entitlement unused.
+      - name: TestHost lane (StoreKitIntegrationTests with SKTestSession, UIKitBoundaryTests)
+        run: |
+          xcodebuild test \
+            -project TestHost/TestHost.xcodeproj \
+            -scheme TestHost \
+            -destination "$SIMULATOR" \
+            -skipPackagePluginValidation \
+            -enableCodeCoverage YES \
+            -resultBundlePath "$RUNNER_TEMP/host.xcresult" \
+            CODE_SIGNING_ALLOWED=NO
+          xcrun xccov view --report --json "$RUNNER_TEMP/host.xcresult" > "$RUNNER_TEMP/host-xccov.json"
+      - name: Coverage gate (97 % per target, 100 % on crash-critical files, ratchet)
+        run: |
+          Scripts/coverage-gate.sh --baseline coverage-baseline.json \
+            --xccov "$RUNNER_TEMP/package-xccov.json" --xccov "$RUNNER_TEMP/host-xccov.json"
       - name: Release build
         run: swift build -c release -Xswiftc -warnings-as-errors
       - name: release_archive_has_no_simulator_symbols
         run: Scripts/check-release-symbols.sh
+      - name: Keep the xcresult bundles
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcresults
+          path: |
+            ${{ runner.temp }}/package.xcresult
+            ${{ runner.temp }}/host.xcresult
+          retention-days: 7
 
   thread-sanitizer:
     runs-on: macos-26
@@ -54,21 +95,6 @@ jobs:
         run: sudo xcode-select -s /Applications/Xcode_26.app
       - name: Test under TSan
         run: swift test --sanitize=thread
-
-  ios-simulator:
-    runs-on: macos-26
-    steps:
-      - uses: actions/checkout@v7
-      - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode_26.app
-      # SWIFT_TREAT_WARNINGS_AS_ERRORS is not set here: Xcode rejects it next to swift-log's own
-      # -suppress-warnings. Zero warnings in this package's code is enforced by the macOS job.
-      - name: Build every product for the iOS Simulator
-        run: |
-          xcodebuild build \
-            -scheme ztron-paywall-kit-Package \
-            -destination 'generic/platform=iOS Simulator' \
-            -skipPackagePluginValidation
 
   # The core must not depend on Darwin. PaywallKit, PaywallCloudSync and PaywallSimulator are Darwin-only targets
   # and are not part of the Linux graph.

@@ -5,7 +5,9 @@ import Foundation
 public protocol LedgerSync: Sendable {
     /// Uploads events and returns the ids the carrier now holds (already-present ids count as acknowledged).
     func push(_ events: [LedgerEvent]) async throws -> Set<String>
-    /// Events the carrier holds that this device may not have. Union-merged by id.
+    /// Events the carrier holds that this device may not have. Union-merged by id. An answer, even an empty one,
+    /// means the carrier has looked: the engine settles the Keychain baseline and the welcome grant on it. A
+    /// carrier that cannot look throws, and the engine waits for the next sync.
     func pull() async throws -> [LedgerEvent]
     /// The fast-path balance known after a reinstall, before the first pull.
     func loadSnapshot() async -> WalletSnapshot?

@@ -47,6 +47,10 @@ private struct PaywallPresenceKey: EnvironmentKey {
     static var defaultValue: AnyPublisher<Bool, Never>? { nil }
 }
 
+private struct PaywallEntitlementKey: EnvironmentKey {
+    static let defaultValue: Entitlement? = nil
+}
+
 extension EnvironmentValues {
     /// The gate of the enclosing `.paywallGated` content. A convenience: correctness never rests on it, because
     /// environment values stop at UIKit boundaries.
@@ -66,6 +70,19 @@ extension EnvironmentValues {
         get { self[PaywallPresenceKey.self] }
         set { self[PaywallPresenceKey.self] = newValue }
     }
+
+    /// The resolved entitlement, `nil` until the first resolution has answered (`Entitlement.unknown`). Set by
+    /// `.paywallSheet`, `.paywallLifecycle()` and `PaywallHostingController`, and kept current from
+    /// `Paywall.entitlement`. For display: gates and `withPaywall` are the only authority on access.
+    public var paywallEntitlement: Entitlement? {
+        get { self[PaywallEntitlementKey.self] }
+        set { self[PaywallEntitlementKey.self] = newValue }
+    }
+}
+
+extension Entitlement {
+    /// `nil` while unresolved, so the environment can say "not yet" instead of "free".
+    var resolved: Entitlement? { self == .unknown ? nil : self }
 }
 
 /// The latest failure of a `.paywallGated` view, for ancestors that use `.onPreferenceChange`. Flows only while

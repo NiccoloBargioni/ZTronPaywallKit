@@ -15,7 +15,7 @@ public actor InMemoryAuditSink: PaywallAuditRepairing {
         Set(
             records.compactMap { record in
                 switch record.event {
-                case .tokensConsumed(_, _, let debitID, _), .auditRepaired(let debitID): return debitID
+                case .tokensConsumed(_, _, let debitID, _), .tokensRefunded(let debitID, _), .auditRepaired(let debitID): return debitID
                 default: return nil
                 }
             })

@@ -230,16 +230,21 @@ struct FailurePathTests {
 
     @Test func audit_sink_with_one_file_rotates_by_truncation() async throws {
         let sink = JournalSink(directory: makeTemporaryPaywallDirectory(), maxBytes: 64, maxFiles: 1)
+        var written: [AuditRecord] = []
         for n in 1...3 {
-            await sink.write(
-                AuditRecord(
-                    at: Date(), uptime: 0, sessionID: UUID(), deviceID: "A", appVersion: "1", build: "1",
-                    environment: "test", event: .tokensGranted(n: n, reason: "r"), entitlementBefore: .free,
-                    entitlementAfter: .free, balanceBefore: 0, balanceAfter: n, previousHash: paywallGenesisHash))
+            let record = AuditRecord(
+                at: Date(), uptime: 0, sessionID: UUID(), deviceID: "A", appVersion: "1", build: "1",
+                environment: "test", event: .tokensGranted(n: n, reason: "r"), entitlementBefore: .free,
+                entitlementAfter: .free, balanceBefore: 0, balanceAfter: n, previousHash: paywallGenesisHash)
+            written.append(record)
+            await sink.write(record)
         }
         let records = await sink.records()
         #expect(records.map(\.balanceAfter) == [3])
-        #expect(await sink.fileURLs().count == 1)
+        #expect(await sink.fileURLs().filter { $0.pathExtension == "jsonl" }.count == 1)
+        // Truncation drops records too: the anchor is the hash of the last one dropped.
+        #expect(await sink.chainAnchor() == written[1].hash)
+        #expect(await sink.retainedSince() == records.first?.at)
     }
 }
 

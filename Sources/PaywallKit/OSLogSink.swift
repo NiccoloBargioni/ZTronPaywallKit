@@ -34,7 +34,7 @@ public struct OSLogSink: PaywallAuditSink {
         case .tokensReserved, .tokensReleased, .tokensConsumed, .tokensRefunded, .tokensCredited, .tokensRevoked,
             .tokensGranted, .syncMerged, .auditRepaired:
             return .wallet
-        case .entitlementChanged, .purchase, .restore, .grandfathered, .storeUnavailable:
+        case .entitlementChanged, .purchase, .purchaseIntent, .restore, .grandfathered, .storeUnavailable, .storefrontChanged:
             return .store
         }
     }

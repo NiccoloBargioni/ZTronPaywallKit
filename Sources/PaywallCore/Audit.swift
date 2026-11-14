@@ -45,9 +45,11 @@ public struct AuditRecord: Codable, Hashable, Sendable {
         SHA256Digest.hex((try? CanonicalJSON.encoder().encode(self)) ?? Data())
     }
 
-    /// The first record whose `previousHash` does not match the record before it.
-    public static func firstBrokenLink(in records: [AuditRecord]) -> AuditRecord? {
-        var previous = paywallGenesisHash
+    /// The first record whose `previousHash` does not match the record before it, the chain starting from
+    /// `anchor`: genesis for a log that was never rotated out, else the hash the last dropped record had
+    /// (`JournalSink.chainAnchor()`).
+    public static func firstBrokenLink(in records: [AuditRecord], after anchor: String = paywallGenesisHash) -> AuditRecord? {
+        var previous = anchor
         for record in records {
             if record.previousHash != previous { return record }
             previous = record.hash
@@ -65,6 +67,14 @@ public protocol PaywallAuditSink: Sendable {
 public protocol PaywallAuditRepairing: PaywallAuditSink {
     func recordedDebitIDs() async -> Set<String>
     func lastRecordHash() async -> String?
+    /// The `at` of the oldest record the sink still holds once it has dropped older ones; `nil` while it holds
+    /// everything it ever wrote. The launch repair leaves debits older than this alone: their records may simply
+    /// have been dropped.
+    func retainedSince() async -> Date?
+}
+
+extension PaywallAuditRepairing {
+    public func retainedSince() async -> Date? { nil }
 }
 
 /// Forwards every record to a closure: the hook for analytics.
@@ -74,10 +84,12 @@ public struct ClosureSink: PaywallAuditSink {
     public func write(_ record: AuditRecord) async { await body(record) }
 }
 
-/// `audit.jsonl` in the paywall directory, rotated at `maxBytes`, oldest file dropped past `maxFiles`.
+/// `audit.jsonl` in the paywall directory, rotated at `maxBytes`, oldest file dropped past `maxFiles`. Dropping a
+/// file writes `audit.anchor`, the hash of the last record dropped: where the retained chain continues from.
 /// File I/O runs on this actor (the design's DurabilityWorker), never on the main actor.
 public actor JournalSink: PaywallAuditRepairing {
     public static let fileName = "audit.jsonl"
+    public static let anchorFileName = "audit.anchor"
     public let directory: URL
     public let maxBytes: Int
     public let maxFiles: Int
@@ -90,7 +102,12 @@ public actor JournalSink: PaywallAuditRepairing {
 
     private var currentURL: URL { directory.appendingPathComponent(Self.fileName) }
 
+    private var anchorURL: URL { directory.appendingPathComponent(Self.anchorFileName) }
+
     private func rotatedURL(_ index: Int) -> URL { directory.appendingPathComponent("audit.\(index).jsonl") }
+
+    /// The current file, then `audit.1.jsonl`, `audit.2.jsonl`, … up to the oldest slot.
+    private var urlsNewestFirst: [URL] { [currentURL] + (1..<max(maxFiles, 1)).map(rotatedURL) }
 
     public func write(_ record: AuditRecord) async {
         guard var line = try? CanonicalJSON.encoder().encode(record) else { return }
@@ -109,45 +126,88 @@ public actor JournalSink: PaywallAuditRepairing {
         }
     }
 
+    /// Shifts the files up one slot and drops the oldest. The last record of the dropped file becomes the anchor
+    /// the retained chain is verified from, and marks that records have been dropped at all.
     private func rotate() {
         let fm = FileManager.default
-        try? fm.removeItem(at: rotatedURL(maxFiles - 1))
+        let dropped = maxFiles > 1 ? rotatedURL(maxFiles - 1) : currentURL
+        if let last = Self.edgeRecord(of: dropped, last: true) {
+            try? Data(last.hash.utf8).write(to: anchorURL, options: .atomic)
+        }
+        try? fm.removeItem(at: dropped)
         if maxFiles > 1 {
             for index in stride(from: maxFiles - 2, through: 1, by: -1) where fm.fileExists(atPath: rotatedURL(index).path) {
                 try? fm.moveItem(at: rotatedURL(index), to: rotatedURL(index + 1))
             }
             try? fm.moveItem(at: currentURL, to: rotatedURL(1))
-        } else {
-            try? fm.removeItem(at: currentURL)
         }
     }
 
     /// Every record, oldest file first.
     public func records() -> [AuditRecord] {
-        let decoder = CanonicalJSON.decoder()
-        var urls: [URL] = []
-        for index in stride(from: maxFiles - 1, through: 1, by: -1) { urls.append(rotatedURL(index)) }
-        urls.append(currentURL)
-        return urls.flatMap { url -> [AuditRecord] in
-            guard let data = FileManager.default.contents(atPath: url.path) else { return [] }
-            return data.split(separator: 0x0A).compactMap { try? decoder.decode(AuditRecord.self, from: Data($0)) }
-        }
+        urlsNewestFirst.reversed().flatMap(Self.records(in:))
     }
 
+    private static func records(in url: URL) -> [AuditRecord] {
+        guard let data = FileManager.default.contents(atPath: url.path) else { return [] }
+        let decoder = CanonicalJSON.decoder()
+        return data.split(separator: 0x0A).compactMap { try? decoder.decode(AuditRecord.self, from: Data($0)) }
+    }
+
+    /// The first (or last) record of `url` that decodes, scanning from that end, so a torn line is skipped and
+    /// nothing else in the file is decoded.
+    private static func edgeRecord(of url: URL, last: Bool) -> AuditRecord? {
+        guard let data = FileManager.default.contents(atPath: url.path) else { return nil }
+        let decoder = CanonicalJSON.decoder()
+        var lines = data.split(separator: 0x0A)
+        if last { lines.reverse() }
+        for line in lines {
+            if let record = try? decoder.decode(AuditRecord.self, from: Data(line)) { return record }
+        }
+        return nil
+    }
+
+    /// The debits the retained files know: consumed, refunded, or repaired already.
     public func recordedDebitIDs() async -> Set<String> {
         Set(
             records().compactMap { record in
-                if case .tokensConsumed(_, _, let debitID, _) = record.event { return debitID }
-                if case .auditRepaired(let debitID) = record.event { return debitID }
-                return nil
+                switch record.event {
+                case .tokensConsumed(_, _, let debitID, _), .tokensRefunded(let debitID, _), .auditRepaired(let debitID):
+                    return debitID
+                default:
+                    return nil
+                }
             })
     }
 
-    public func lastRecordHash() async -> String? { records().last?.hash }
+    /// The hash of the newest record, read from the tail of the newest file that has one.
+    public func lastRecordHash() async -> String? {
+        for url in urlsNewestFirst {
+            if let record = Self.edgeRecord(of: url, last: true) { return record.hash }
+        }
+        return nil
+    }
 
-    /// The audit files present on disk, for export.
+    /// The `at` of the oldest record on disk once rotation has dropped a file; `nil` while every record ever
+    /// written is still here; `.distantFuture` when a file was dropped and nothing survives.
+    public func retainedSince() async -> Date? {
+        guard FileManager.default.fileExists(atPath: anchorURL.path) else { return nil }
+        for url in urlsNewestFirst.reversed() {
+            if let record = Self.edgeRecord(of: url, last: false) { return record.at }
+        }
+        return .distantFuture
+    }
+
+    /// Where the retained chain starts: the hash of the last record rotation dropped, or genesis.
+    public func chainAnchor() -> String {
+        guard let data = FileManager.default.contents(atPath: anchorURL.path), let anchor = String(data: data, encoding: .utf8)
+        else { return paywallGenesisHash }
+        return anchor
+    }
+
+    /// The audit files present on disk, for export: the records and, once rotation dropped a file, the anchor.
     public func fileURLs() -> [URL] {
-        ([currentURL] + (1..<max(maxFiles, 1)).map(rotatedURL)).filter { FileManager.default.fileExists(atPath: $0.path) }
+        (urlsNewestFirst + [anchorURL]).filter { FileManager.default.fileExists(atPath: $0.path) }
     }
 }
 

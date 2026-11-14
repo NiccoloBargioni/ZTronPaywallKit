@@ -1,5 +1,4 @@
 #if DEBUG
-    import AppKit
     import Combine
     import Foundation
     import PaywallCore
@@ -9,6 +8,58 @@
     import Testing
 
     @testable import PaywallSimulator
+
+    #if canImport(AppKit)
+        import AppKit
+        typealias HostWindow = NSWindow
+    #else
+        import UIKit
+        typealias HostWindow = UIWindow
+    #endif
+
+    /// Puts `view` on screen in a real window (AppKit or UIKit) and pumps layout so appear callbacks run.
+    @MainActor
+    private func show<V: View>(_ view: V) -> HostWindow {
+        #if canImport(AppKit)
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 200, height: 200), styleMask: [.titled], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            window.contentViewController = NSHostingController(rootView: view)
+            window.orderFront(nil)
+        #else
+            let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 200, height: 200))
+            window.rootViewController = UIHostingController(rootView: view)
+            window.makeKeyAndVisible()
+        #endif
+        return window
+    }
+
+    @MainActor
+    private func replaceContent<V: View>(of window: HostWindow, with view: V) {
+        #if canImport(AppKit)
+            window.contentViewController = NSHostingController(rootView: view)
+        #else
+            window.rootViewController = UIHostingController(rootView: view)
+        #endif
+    }
+
+    @MainActor
+    private func layout(_ window: HostWindow) {
+        #if canImport(AppKit)
+            window.contentView?.layoutSubtreeIfNeeded()
+        #else
+            window.layoutIfNeeded()
+        #endif
+    }
+
+    @MainActor
+    private func dismiss(_ window: HostWindow) {
+        #if canImport(AppKit)
+            window.close()
+        #else
+            window.rootViewController = nil
+            window.isHidden = true
+        #endif
+    }
 
     private let catalog = ProductCatalog.simulatorDefault
 
@@ -25,13 +76,10 @@
 
     /// Hosts a SwiftUI view in a real window long enough for appear callbacks to run.
     @MainActor
-    private func host<V: View>(_ view: V) async -> NSWindow {
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 200, height: 200), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.contentViewController = NSHostingController(rootView: view)
-        window.orderFront(nil)
+    private func host<V: View>(_ view: V) async -> HostWindow {
+        let window = show(view)
         for _ in 0..<20 {
-            window.contentView?.layoutSubtreeIfNeeded()
+            layout(window)
             await Task.yield()
             try? await Task.sleep(nanoseconds: 5_000_000)
         }
@@ -143,6 +191,22 @@
             }
         }
 
+        @Test func a_family_shared_lifetime_simulates_as_shared() async {
+            var simulation = PaywallSimulation()
+            simulation.entitlement = .lifetime(.familyShared(transactionID: 77))
+            await configure(simulation)
+            #expect(Paywall.shared.entitlement == .lifetime(.familyShared(transactionID: 77)))
+            #expect(Paywall.shared.entitlement.isFamilyShared)
+            #expect(outcome(.paid, "paid") == nil)
+            PaywallSimulator.shared.refund(.lifetime)
+            var free = false
+            for _ in 0..<200 where !free {
+                try? await Task.sleep(nanoseconds: 5_000_000)
+                free = Paywall.shared.entitlement == .free
+            }
+            #expect(free)
+        }
+
         @Test func audit_records_say_simulated() async throws {
             await configure(PaywallSimulation(.free))
             _ = outcome(.paid, "x")
@@ -183,13 +247,13 @@
             PaywallSimulator.shared.refund(.subscription)
             var flipped = false
             for _ in 0..<200 where !flipped {
-                window.contentView?.layoutSubtreeIfNeeded()
+                layout(window)
                 try? await Task.sleep(nanoseconds: 5_000_000)
                 flipped = log.entries.contains { $0.hasPrefix("denied") }
             }
             #expect(flipped)
             #expect(Paywall.shared.entitlement == .free)
-            window.close()
+            dismiss(window)
         }
 
         @Test func refund_lifetime_and_last_token_pack() async {
@@ -332,7 +396,7 @@
             default:
                 #expect(log.entries.first == "denied:requiresPaid")
             }
-            window.close()
+            dismiss(window)
         }
 
         @Test func reserve_on_appear_commit_through_session_release_on_disappear() async {
@@ -348,10 +412,174 @@
             let window = await host(Committer { committed = $0 }.paywallGated(.tokens(3), id: "tool"))
             #expect(committed == true)
             #expect(Paywall.shared.wallet == Wallet(balance: 2, reserved: 0))
-            window.contentViewController = NSHostingController(rootView: Text("gone"))
-            for _ in 0..<20 { await Task.yield() }
+            replaceContent(of: window, with: Text("gone"))
+            for _ in 0..<20 {
+                layout(window)
+                await Task.yield()
+                try? await Task.sleep(nanoseconds: 5_000_000)
+            }
             #expect(Paywall.shared.wallet.reserved == 0)
-            window.close()
+            dismiss(window)
+        }
+
+        // MARK: Service provider
+
+        @Test func a_simulated_service_is_a_fake_on_the_shared_facade() async {
+            let provider = PaywallServiceProvider(.simulated(PaywallSimulation(.lifetime), catalog: catalog))
+            #expect(provider.isFake)
+            #expect(provider.service.name == "fake")
+            #expect(provider.paywall === Paywall.shared)
+            #expect(Paywall.shared.provider === provider)
+            await Paywall.shared.waitUntilStarted()
+            #expect(Paywall.shared.entitlement == .lifetime(.purchase(transactionID: PaywallSimulation.lifetimeTransactionID)))
+            #expect(Paywall.shared.configuration?.environmentLabel == "simulated")
+            #expect(PaywallSimulator.shared.catalog == catalog)
+        }
+
+        @Test func launch_arguments_pick_the_fake_only_when_present() async {
+            var production = Paywall.Configuration(catalog: catalog)
+            production.grandfathering = GrandfatheringPolicy(
+                lastPaidBuild: "116",
+                paidWindow: DateInterval(start: Date(timeIntervalSince1970: 0), end: Date(timeIntervalSince1970: 1_700_000_000)))
+
+            let none = PaywallServiceProvider.Service.fromLaunchArguments(PaywallLaunchArguments([]), production: production)
+            #expect(!none.isFake)
+            #expect(none.configuration.catalog == catalog)
+            #expect(none.configuration.grandfathering == production.grandfathering)
+
+            let some = PaywallServiceProvider.Service.fromLaunchArguments(
+                PaywallLaunchArguments([PaywallLaunchArgument.preset.rawValue, PaywallPreset.tokens5.rawValue]),
+                production: production)
+            #expect(some.isFake)
+            let provider = PaywallServiceProvider(some)
+            await Paywall.shared.waitUntilStarted()
+            #expect(provider.isFake)
+            #expect(Paywall.shared.wallet.balance == 5)
+            // The fake runs on the production catalog and grandfathering policy.
+            #expect(PaywallSimulator.shared.catalog == catalog)
+            #expect(PaywallSimulator.shared.grandfathering == production.grandfathering)
+        }
+
+        @Test func the_launch_argument_fake_can_be_asked_for_directly() async {
+            let provider = PaywallServiceProvider(
+                .simulated(
+                    PaywallLaunchArguments([PaywallLaunchArgument.preset.rawValue, PaywallPreset.lifetime.rawValue]),
+                    catalog: catalog))
+            await Paywall.shared.waitUntilStarted()
+            #expect(provider.isFake)
+            #expect(Paywall.shared.entitlement.isPaying)
+        }
+
+        @Test func use_switches_from_production_to_the_fake_and_back() async {
+            var production = Paywall.Configuration(catalog: catalog)
+            production.store = FakeStore()  // this process is not entitled for StoreKit; the label is what is under test
+            production.clock = FakeClock()
+            production.storageDirectory = makeTemporaryPaywallDirectory()
+            production.includesDefaultAudit = false
+            production.connectivity = nil
+            production.welcomeTokens = 0
+            let provider = PaywallServiceProvider(.production(production))
+            await Paywall.shared.waitUntilStarted()
+            #expect(!provider.isFake)
+            #expect(Paywall.shared.wallet.balance == 0)
+
+            provider.use(.simulated(PaywallSimulation(.tokens5), catalog: catalog))
+            await Paywall.shared.waitUntilStarted()
+            #expect(provider.isFake)
+            #expect(Paywall.shared.wallet.balance == 5)
+            #expect(Paywall.shared.configuration?.environmentLabel == "simulated")
+
+            provider.use(.production(production))
+            await Paywall.shared.waitUntilStarted()
+            #expect(!provider.isFake)
+            #expect(Paywall.shared.configuration?.environmentLabel == nil)
+            #expect(Paywall.shared.wallet.balance == 0)
+        }
+
+        /// `#Preview` content finds the provider too, so a child with `@EnvironmentObject var provider` renders.
+        @Test func the_preview_modifier_installs_a_provider() async {
+            struct ProviderBadge: View {
+                @EnvironmentObject var provider: PaywallServiceProvider
+                @EnvironmentObject var paywall: Paywall
+                @Environment(\.paywallEntitlement) var entitlement
+                let onAppear: (String, Bool, Entitlement?) -> Void
+                var body: some View {
+                    Text(provider.service.name)
+                        .onAppear { onAppear(provider.service.name, paywall === Paywall.shared, entitlement) }
+                }
+            }
+            var seen: (String, Bool, Entitlement?)?
+            let window = await host(ProviderBadge { seen = ($0, $1, $2) }.paywallSimulation(PaywallSimulation(.lifetime)))
+            #expect(seen?.0 == "fake")
+            #expect(seen?.1 == true)
+            #expect(seen?.2 == .lifetime(.purchase(transactionID: PaywallSimulation.lifetimeTransactionID)))
+            #expect(Paywall.shared.provider != nil)
+            dismiss(window)
+        }
+
+        /// A production configuration for the shared facade that never reaches StoreKit (this process is not entitled).
+        private func productionConfiguration(catalog: ProductCatalog, grandfathering: GrandfatheringPolicy? = nil) -> Paywall.Configuration {
+            var production = Paywall.Configuration(catalog: catalog)
+            production.grandfathering = grandfathering
+            production.store = FakeStore()
+            production.clock = FakeClock()
+            production.storageDirectory = makeTemporaryPaywallDirectory()
+            production.includesDefaultAudit = false
+            production.connectivity = nil
+            production.welcomeTokens = 0
+            return production
+        }
+
+        @Test func useSimulated_takes_the_catalog_and_the_policy_from_the_production_configuration() async {
+            let other = ProductCatalog(
+                subscriptionGroupID: "other", weekly: "o.weekly", monthly: "o.monthly", yearly: "o.yearly", lifetime: "o.lifetime",
+                tokenPacks: [TokenPack(productID: "o.tokens.10", tokens: 10)])
+            let policy = GrandfatheringPolicy(
+                lastPaidBuild: "116",
+                paidWindow: DateInterval(start: Date(timeIntervalSince1970: 0), end: Date(timeIntervalSince1970: 1_700_000_000)))
+            let production = productionConfiguration(catalog: other, grandfathering: policy)
+            let provider = PaywallServiceProvider(.production(production))
+            await Paywall.shared.waitUntilStarted()
+            #expect(!provider.isFake)
+
+            #expect(provider.useSimulated(.tokens5) === provider)
+            await Paywall.shared.waitUntilStarted()
+            #expect(provider.isFake)
+            #expect(Paywall.shared.wallet.balance == 5)
+            #expect(Paywall.shared.configuration?.environmentLabel == "simulated")
+            #expect(PaywallSimulator.shared.catalog == other)
+            #expect(PaywallSimulator.shared.grandfathering == policy)
+
+            provider.useProduction()
+            await Paywall.shared.waitUntilStarted()
+            #expect(!provider.isFake)
+            #expect(Paywall.shared.configuration?.catalog == other)
+            #expect(Paywall.shared.configuration?.environmentLabel == nil)
+        }
+
+        @Test func useSimulated_without_a_production_configuration_uses_the_simulator_defaults() async {
+            let provider = PaywallServiceProvider(.simulated(PaywallSimulation(.free), catalog: catalog))
+            await Paywall.shared.waitUntilStarted()
+            #expect(Paywall.shared.entitlement == .free)
+            provider.useSimulated(PaywallSimulation(.lifetime))
+            await Paywall.shared.waitUntilStarted()
+            #expect(provider.isFake)
+            #expect(Paywall.shared.entitlement == .lifetime(.purchase(transactionID: PaywallSimulation.lifetimeTransactionID)))
+            #expect(PaywallSimulator.shared.catalog == .simulatorDefault)
+            #expect(PaywallSimulator.shared.grandfathering == PaywallSimulator.simulatedPolicy)
+        }
+
+        @Test func useSimulated_explicit_catalog_and_policy_win_over_the_defaults() async {
+            let policy = GrandfatheringPolicy(
+                environments: [.xcode], lastPaidBuild: "5",
+                paidWindow: DateInterval(start: Date(timeIntervalSince1970: 0), end: Date(timeIntervalSince1970: 100)))
+            let provider = PaywallServiceProvider(.production(productionConfiguration(catalog: catalog)))
+            await Paywall.shared.waitUntilStarted()
+            provider.useSimulated(.grandfathered, catalog: .simulatorDefault, grandfathering: policy)
+            await Paywall.shared.waitUntilStarted()
+            #expect(provider.isFake)
+            #expect(PaywallSimulator.shared.grandfathering == policy)
+            #expect(Paywall.shared.entitlement.isPaying)
         }
     }
 #endif

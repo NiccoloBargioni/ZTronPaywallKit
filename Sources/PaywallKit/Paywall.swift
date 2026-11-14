@@ -22,8 +22,20 @@ public final class Paywall: ObservableObject {
         /// `S`: the lease window after a token draw.
         public var tolerance: TimeInterval = 300
         public var leasePolicy: LeasePolicy = .fixedFromDraw
+        /// Tokens a new account gets once to try the app, as the ledger grant `grant:welcome`, at the value of the
+        /// build that writes it: a later build with another value leaves existing users with what their first build
+        /// granted, less what they spent. Written at the first launch, or once the carrier has answered when `sync`
+        /// is set, so a new device of an existing account takes the account's grant. `0` grants nothing.
+        public var welcomeTokens = 100
+        /// Prices and offers are fetched again at launch and foreground when the last fetch is older than this; a
+        /// purchase or a restore fetches at once.
+        public var storefrontRefreshInterval: TimeInterval = 3_600
         /// Last paid build, paid window, sentinel, grant.
         public var grandfathering: GrandfatheringPolicy?
+        /// What another family member's subscription or lifetime purchase is worth on this account. Applied at
+        /// every resolution and to the cached snapshot, so a build that changes it takes effect at its first launch.
+        /// Tokens never cross family members whatever the value: the account key is per Apple Account.
+        public var familySharing: FamilySharingPolicy = .sharedEntitlements
         /// Extra sinks (analytics). The local journal and OSLog are added unless `includesDefaultAudit` is false.
         public var audit: [any PaywallAuditSink] = []
         public var includesDefaultAudit = true
@@ -40,6 +52,14 @@ public final class Paywall: ObservableObject {
         public var environmentLabel: String?
         /// `F_FULLFSYNC` on the draw path (default) or `fsync` only.
         public var fullSync = true
+        /// Progressive adoption: `true` switches the whole mechanism off. Nothing starts (no engine, journal,
+        /// store call, sync or audit), every gate passes as `.free`, `purchase(_:)` answers
+        /// `.purchased(transactionID: 0)` without a payment, `products()` is empty and nothing is published.
+        /// `false`, the default, is the product. Flip it by calling `configure` again.
+        public var passthrough = false
+        /// Posts every event to this center for the facade's lifetime (see `bridgeToNotificationCenter`), so
+        /// `NotificationCenter` code can observe `.paywallDenied`, `.paywallPurchaseCompleted` and the other names.
+        public var notificationCenter: NotificationCenter?
         /// Runs once the launch resolution finished (the simulator seeds its switches here).
         public var onStart: (@MainActor (GateEngine) async -> Void)?
         #if DEBUG
@@ -51,11 +71,7 @@ public final class Paywall: ObservableObject {
             self.catalog = catalog
         }
 
-        public static var defaultStorageDirectory: URL {
-            let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-                ?? FileManager.default.temporaryDirectory
-            return base.appendingPathComponent("ztron.paywall", isDirectory: true)
-        }
+        public static var defaultStorageDirectory: URL { let base: URL; if let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first { base = support } else { base = FileManager.default.temporaryDirectory }; return base.appendingPathComponent("ztron.paywall", isDirectory: true) }
     }
 
     public enum ConfigurationError: Error, Hashable, Sendable {
@@ -67,17 +83,39 @@ public final class Paywall: ObservableObject {
 
     @Published public private(set) var entitlement: Entitlement = .unknown
     @Published public private(set) var wallet: Wallet = .empty
+    /// What the App Store sells right now, with prices and offers: the last fetch, from this launch or from disk,
+    /// `nil` until the first one ever answers. `refreshStorefront()` fetches now.
+    @Published public private(set) var storefront: PaywallStorefront?
+    /// Where the user stands, from `entitlement` and `wallet`; `nil` while the entitlement is unknown.
+    @Published public private(set) var tier: AccessTier?
     /// Drives `.paywallSheet`. Set at the end of the run-loop turn for a denial nobody claimed.
     @Published public var pendingFailure: PaywallFailure?
+    /// The `.paywallSheet` presenters installed right now, weakly, for the one-presenter rule.
+    var sheetPresenters = NSHashTable<PaywallPresenterAnchor>.weakObjects()
+    /// Fires when a presenter arrives, goes, or enters or leaves a window, so the others re-decide.
+    let presenterChanges = PassthroughSubject<Void, Never>()
+    /// While a denial is pending and no presenter could take it (a plain sheet is up), nudges them regularly.
+    private var nudgeTask: Task<Void, Never>?
+    /// The product id of a promoted in-app purchase the user tapped on the App Store (`PurchaseIntent`), until the
+    /// host consumes it or starts buying it. The paywall screen opens on this product.
+    @Published public private(set) var pendingPurchaseIntent: String?
     /// The last configuration problem; the facade fails closed meanwhile.
     @Published public private(set) var configurationError: ConfigurationError?
+    /// `true` while `Configuration.passthrough` keeps the mechanism off: no engine, every gate passes, every
+    /// purchase succeeds without a payment, nothing is published. `entitlement` stays `.unknown` and `wallet`
+    /// `.empty` meanwhile, so an account screen branches on this rather than on them.
+    @Published public private(set) var isPassthrough = false
 
     public private(set) var engine: GateEngine?
     public private(set) var configuration: Configuration?
+    /// The `PaywallServiceProvider` that configured this facade, when the app installed one at its root; `nil` for a
+    /// facade configured directly. `PaywallHostingController` re-injects it under UIKit layers.
+    public internal(set) weak var provider: PaywallServiceProvider?
     private let subject = PassthroughSubject<PaywallEvent, Never>()
     private var streams: [UUID: AsyncStream<PaywallEvent>.Continuation] = [:]
     private var startTask: Task<Void, Never>?
     private var fallbackTasks: [UUID: Task<Void, Never>] = [:]
+    private var notificationBridge: AnyCancellable?
     private let logger = Logger(label: "ztron.paywall.facade")
 
     /// Internal so tests can build isolated facades; apps use `shared`.
@@ -91,6 +129,17 @@ public final class Paywall: ObservableObject {
     public func configure(_ configuration: Configuration) {
         teardown()
         let problems = configuration.catalog.validate()
+        if configuration.passthrough {
+            // Progressive adoption: nothing starts and nothing fails closed. A catalog problem is only logged.
+            if !problems.isEmpty {
+                logger.warning("paywall: passthrough with an invalid catalog", metadata: ["problems": "\(problems)"])
+            }
+            logger.notice("paywall: passthrough, the mechanism is off")
+            configurationError = nil
+            self.configuration = configuration
+            isPassthrough = true
+            return
+        }
         guard problems.isEmpty else {
             logger.error("paywall: invalid catalog", metadata: ["problems": "\(problems)"])
             configurationError = .invalidCatalog(problems)
@@ -106,10 +155,13 @@ public final class Paywall: ObservableObject {
         let base = GateEngine.Settings(
             tolerance: configuration.tolerance,
             leasePolicy: configuration.leasePolicy,
+            familySharing: configuration.familySharing,
             environmentLabel: configuration.environmentLabel,
             appVersion: info?["CFBundleShortVersionString"] as? String ?? "0",
             build: info?["CFBundleVersion"] as? String ?? "0",
-            fullSync: configuration.fullSync
+            fullSync: configuration.fullSync,
+            welcomeTokens: configuration.welcomeTokens,
+            storefrontRefreshInterval: configuration.storefrontRefreshInterval
         )
         #if DEBUG
             let settings = base.with(grandfatherOverride: configuration.grandfatherOverride)
@@ -133,6 +185,7 @@ public final class Paywall: ObservableObject {
         self.engine = engine
         engine.onEvent = { [weak self] event in self?.publish(event) }
         engine.onStateChange = { [weak self] in self?.mirror() }
+        if let center = configuration.notificationCenter { notificationBridge = bridgeToNotificationCenter(center) }
         mirror()
         let onStart = configuration.onStart
         startTask = Task {
@@ -155,7 +208,12 @@ public final class Paywall: ObservableObject {
         engine = nil
         for task in fallbackTasks.values { task.cancel() }
         fallbackTasks = [:]
+        notificationBridge = nil
+        if isPassthrough { isPassthrough = false }
+        nudgeTask?.cancel()
+        nudgeTask = nil
         pendingFailure = nil
+        pendingPurchaseIntent = nil
         mirror()
     }
 
@@ -163,10 +221,14 @@ public final class Paywall: ObservableObject {
         guard let engine else {
             if entitlement != .unknown { entitlement = .unknown }
             if wallet != .empty { wallet = .empty }
+            if storefront != nil { storefront = nil }
+            if tier != nil { tier = nil }
             return
         }
         if entitlement != engine.entitlement { entitlement = engine.entitlement }
         if wallet != engine.wallet { wallet = engine.wallet }
+        if storefront != engine.storefront { storefront = engine.storefront }
+        if tier != engine.tier { tier = engine.tier }
     }
 
     // MARK: Events
@@ -186,6 +248,15 @@ public final class Paywall: ObservableObject {
     }
 
     func publish(_ event: PaywallEvent) {
+        switch event {
+        case .purchaseIntent(let productID):
+            pendingPurchaseIntent = productID
+        case .purchase(.started, let productID, _, _) where productID == pendingPurchaseIntent:
+            // The paywall opened on the promoted product and the user is buying it: the intent is served.
+            pendingPurchaseIntent = nil
+        default:
+            break
+        }
         subject.send(event)
         for continuation in streams.values { continuation.yield(event) }
         if case .gateDenied(let failure) = event { scheduleFallback(failure) }
@@ -197,16 +268,42 @@ public final class Paywall: ObservableObject {
         let id = failure.id
         fallbackTasks[id] = Task { [weak self] in
             guard let self, !Task.isCancelled else { return }
-            if !failure.isClaimed, self.pendingFailure == nil { self.pendingFailure = failure }
+            if !failure.isClaimed, self.pendingFailure == nil {
+                self.pendingFailure = failure
+                self.nudgePresenters()
+            }
             failure.forgetClaim()
             self.fallbackTasks[id] = nil
         }
     }
 
-    /// Lets the first presenter take the pending failure, so two installed sheets cannot both show it.
+    /// Every quarter second while the denial stays pending, asks the presenters again: the one that could not
+    /// present (its root was showing a plain sheet) takes it once that sheet is gone.
+    private func nudgePresenters() {
+        nudgeTask?.cancel()
+        nudgeTask = Task { @MainActor [weak self] in
+            while let self, self.pendingFailure != nil, !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                guard !Task.isCancelled else { return }
+                self.presenterChanges.send()
+            }
+        }
+    }
+
+    /// Lets the presenter that can show the pending failure take it, so two installed sheets cannot both show it.
     public func consumePendingFailure() -> PaywallFailure? {
-        defer { pendingFailure = nil }
+        defer {
+            pendingFailure = nil
+            nudgeTask?.cancel()
+            nudgeTask = nil
+        }
         return pendingFailure
+    }
+
+    /// Takes the promoted product the host is about to show, so nothing else presents it too.
+    public func consumePendingPurchaseIntent() -> String? {
+        defer { pendingPurchaseIntent = nil }
+        return pendingPurchaseIntent
     }
 
     // MARK: Gates
@@ -217,7 +314,8 @@ public final class Paywall: ObservableObject {
 
     /// Pure read: no draw, no lease, no log.
     public func canPass(_ level: GateLevel, id: String? = nil) -> Bool {
-        guard let engine else { return level == .free }
+        // No engine: unconfigured or failed, closed except `.free`; in passthrough, every level is `.free`.
+        guard let engine else { return level == .free || isPassthrough }
         return engine.canPass(level, gateID: id)
     }
 
@@ -227,7 +325,7 @@ public final class Paywall: ObservableObject {
     ) -> PaywallOutcome<Void> {
         let source = PaywallSource(id: id, fileID: fileID, function: function, line: line)
         guard let engine else {
-            if level == .free { return .executed(()) }
+            if level == .free || isPassthrough { return .executed(()) }
             let failure = unconfiguredFailure(level, source: source, scope: nil)
             publish(.gateDenied(failure))
             return .blocked(failure)
@@ -239,7 +337,7 @@ public final class Paywall: ObservableObject {
         _ level: GateLevel, source: PaywallSource, scope: String?, holder: UUID?, _ body: () throws -> R
     ) rethrows -> PaywallOutcome<R> {
         guard let engine else {
-            if level == .free { return .executed(try body()) }
+            if level == .free || isPassthrough { return .executed(try body()) }
             let failure = unconfiguredFailure(level, source: source, scope: scope)
             publish(.gateDenied(failure))
             return .blocked(failure)
@@ -250,7 +348,7 @@ public final class Paywall: ObservableObject {
     static func begin(_ level: GateLevel, source: PaywallSource, scope: String?, holder: UUID?) -> GateBegin {
         let paywall = Paywall.active
         guard let engine = paywall.engine else {
-            if level == .free {
+            if level == .free || paywall.isPassthrough {
                 return .open(GateTicket(level: level, source: source, mode: .free, debitID: nil, tokens: 0, leaseUntil: nil, holder: nil))
             }
             let failure = paywall.unconfiguredFailure(level, source: source, scope: scope)
@@ -270,9 +368,13 @@ public final class Paywall: ObservableObject {
         onChange: @escaping (GateSessionState) -> Void
     ) -> GateSessionState {
         guard let engine else {
-            let decision: GateDecision = level == .free ? .open(.free) : .closed(.entitlementUnavailable)
-            if case .closed = decision { publish(.gateDenied(unconfiguredFailure(level, source: source, scope: scope))) }
-            return GateSessionState(holder: holder, level: level, source: source, scope: scope, decision: decision)
+            if level == .free || isPassthrough {
+                return GateSessionState(holder: holder, level: level, source: source, scope: scope, decision: .open(.free))
+            }
+            let failure = unconfiguredFailure(level, source: source, scope: scope)
+            publish(.gateDenied(failure))
+            return GateSessionState(
+                holder: holder, level: level, source: source, scope: scope, decision: .closed(failure.reason), failure: failure)
         }
         return engine.openSession(holder: holder, level: level, policy: policy, source: source, scope: scope, onChange: onChange)
     }
@@ -282,17 +384,29 @@ public final class Paywall: ObservableObject {
     // MARK: Store
 
     public func products() async throws -> [PaywallProduct] {
+        if isPassthrough { return [] }
         guard let engine else { throw StoreClientError.notConfigured }
         return try await engine.products()
     }
 
+    /// Fetches what the App Store sells right now, with prices and offers, publishes it as `storefront` and returns
+    /// it. In passthrough, an empty storefront.
+    public func refreshStorefront() async throws -> PaywallStorefront {
+        if isPassthrough { return PaywallStorefront(products: [], fetchedAt: Date()) }
+        guard let engine else { throw StoreClientError.notConfigured }
+        return try await engine.refreshStorefront()
+    }
+
     public func purchase(_ product: PaywallProduct, source: PaywallSource? = nil) async throws -> PurchaseOutcome {
+        // Passthrough: "bought" without a payment, and 0 is no transaction.
+        if isPassthrough { return .purchased(transactionID: 0) }
         guard let engine else { throw StoreClientError.notConfigured }
         return try await engine.purchase(productID: product.id, source: source)
     }
 
     /// `AppStore.sync()`: can prompt for sign-in, so wire it to the Restore button only.
     public func restorePurchases() async throws {
+        if isPassthrough { return }
         guard let engine else { throw StoreClientError.notConfigured }
         try await engine.restore()
     }
@@ -309,6 +423,7 @@ public final class Paywall: ObservableObject {
 
     /// Renewal phase for the account screen. Goes to the App Store.
     public func subscriptionPhase() async throws -> SubscriptionPhase? {
+        if isPassthrough { return nil }
         guard let engine else { throw StoreClientError.notConfigured }
         return try await engine.store.subscriptionPhase(groupID: engine.catalog.subscriptionGroupID)
     }

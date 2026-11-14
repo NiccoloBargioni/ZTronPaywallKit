@@ -16,6 +16,7 @@
 #   swift test --enable-code-coverage
 #   Scripts/coverage-gate.sh [--targets "PaywallCore PaywallTesting"] [--xccov report.json]...
 #                            [--baseline coverage-baseline.json] [--write-baseline coverage-baseline.json]
+#   --write-baseline rewrites the file only when the gate passes, so a failed run never lowers the ratchet.
 #                            [--threshold 97]
 #
 # Exit status: 0 when every requested target passes, 1 otherwise. No exclusions.
@@ -182,7 +183,8 @@ if baseline_path and os.path.exists(baseline_path):
                 print(f"  {target} {kind}: {numbers[kind]:.2f}% < baseline {before[kind]:.2f}%  FAIL")
                 failed = True
 
-if write_baseline:
+# A ratchet never writes itself down: a failed run leaves the baseline alone.
+if write_baseline and not failed:
     with open(write_baseline, "w") as out:
         json.dump(summary, out, indent=2, sort_keys=True)
         out.write("\n")

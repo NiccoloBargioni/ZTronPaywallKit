@@ -8,13 +8,14 @@ extension Paywall {
     }
 
     /// The first audit record whose hash does not match its predecessor (`nil`: the chain is intact), and the
-    /// first ledger event whose per-device link is broken.
+    /// first ledger event whose per-device link is broken. The audit chain is checked from where the retained
+    /// files start: genesis, or the hash rotation dropped at (`JournalSink.chainAnchor()`).
     public func verifyAuditChain() async -> (audit: AuditRecord?, ledger: LedgerEvent?) {
         guard let engine else { return (nil, nil) }
         await engine.flushAudit()
-        let directory = engine.directory
-        let records = await JournalSink(directory: directory).records()
-        return (AuditRecord.firstBrokenLink(in: records), engine.ledger.firstBrokenLink())
+        let sink = JournalSink(directory: engine.directory)
+        let records = await sink.records()
+        return (AuditRecord.firstBrokenLink(in: records, after: await sink.chainAnchor()), engine.ledger.firstBrokenLink())
     }
 
     /// One zip for a support case or an App Store dispute: the audit journal, the ledger, the derived lease table,

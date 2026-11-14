@@ -26,6 +26,7 @@ extension GateEngine {
         lastResolution = clock.now
         if let grandfathered = resolution.grandfathered { recordGrandfather(grandfathered) }
         setEntitlement(resolution.entitlement, cause: cause)
+        // Saved on every successful resolution: `resolvedAt` is the snapshot age `storeUnavailable` reports.
         PaywallFiles(directory: directory).saveEntitlementSnapshot(resolution.entitlement, at: clock.now)
         armExpiryTimer(resolution.expiresAt)
 
@@ -75,7 +76,7 @@ extension GateEngine {
     private func armExpiryTimer(_ expiresAt: Date?) {
         expiryTask?.cancel()
         expiryTask = nil
-        guard let expiresAt else { return }
+        guard let expiresAt, !isShutDown else { return }
         let clock = clock
         expiryTask = Task { [weak self] in
             do {
@@ -123,30 +124,86 @@ extension GateEngine {
         await store.finish(transactionID: transaction.id)
     }
 
-    // MARK: Purchases
+    // MARK: Promoted in-app purchases
 
-    public func products() async throws -> [PaywallProduct] {
-        let files = PaywallFiles(directory: directory)
-        do {
-            // The catalog is the authority on what a product is (StoreKit does not know a pack's size).
-            let products = try await store.products(for: catalog.allProductIDs).map { product in
-                var mapped = product
-                mapped.kind = catalog.kind(of: product.id) ?? product.kind
-                return mapped
-            }
-            files.savePrices(products, at: clock.now)
-            return products
-        } catch {
-            // Offline: last-known prices with an "as of" date, and the buy button disabled.
-            guard let cache = files.prices() else { throw error }
-            return cache.products.map { product in
-                var cached = product
-                cached.priceAsOf = cache.at
-                cached.isPurchasable = false
-                return cached
+    /// `PurchaseIntent.intents`: the user tapped a promoted product on the App Store. The engine publishes the
+    /// intent and nothing more; the host's paywall opens on that product and the purchase goes through `purchase`.
+    func startPurchaseIntentsListener() async {
+        intentsTask?.cancel()
+        let intents = await store.purchaseIntents()
+        intentsTask = Task { [weak self] in
+            for await productID in intents {
+                guard let self, !Task.isCancelled else { return }
+                self.emit(.purchaseIntent(productID: productID))
             }
         }
     }
+
+    // MARK: Storefront
+
+    /// What the paywall screen shows: the storefront fetched now, or offline the last one with its prices marked
+    /// `priceAsOf` and the buy button disabled. Throws when nothing was ever fetched.
+    public func products() async throws -> [PaywallProduct] {
+        do {
+            return try await refreshStorefront().products
+        } catch {
+            guard let cached = storefront else { throw error }
+            return cached.products.map { product in
+                var offline = product
+                offline.priceAsOf = cached.fetchedAt
+                offline.isPurchasable = false
+                return offline
+            }
+        }
+    }
+
+    /// Fetches the catalog's products from the store: what it sells right now, with prices and offers, in catalog
+    /// order. The result replaces `storefront`, is saved next to the journal, and is published as
+    /// `.storefrontChanged` when the listing differs from the last one. Throws offline; `storefront` then still holds
+    /// the last fetch, from this launch or from disk.
+    public func refreshStorefront() async throws -> PaywallStorefront {
+        let fetched = try await store.products(for: catalog.allProductIDs)
+        let countryCode = await store.storefrontCountryCode()
+        guard !isTerminated, !isShutDown else { throw CancellationError() }
+        var listed: [PaywallProduct] = []
+        var unavailable: [String] = []
+        for entry in catalog.entries where !entry.isRetired {
+            if var product = fetched.first(where: { $0.id == entry.productID }) {
+                // The catalog is the authority on what a product is (StoreKit does not know a pack's size).
+                product.kind = entry.kind
+                listed.append(product)
+            } else {
+                unavailable.append(entry.productID)
+            }
+        }
+        let next = PaywallStorefront(products: listed, unavailableProductIDs: unavailable, countryCode: countryCode, fetchedAt: clock.now)
+        let changed = storefront.map { !$0.hasSameListing(as: next) } ?? true
+        storefront = next
+        PaywallFiles(directory: directory).saveStorefront(next)
+        if changed { emit(.storefrontChanged(productIDs: listed.map(\.id), countryCode: countryCode)) }
+        onStateChange?()
+        return next
+    }
+
+    /// Launch and foreground: a fetch when the storefront was never fetched or is older than
+    /// `settings.storefrontRefreshInterval`. Offline, the last one stands.
+    func refreshStorefrontIfStale() async {
+        if let storefront, clock.now.timeIntervalSince(storefront.fetchedAt) < settings.storefrontRefreshInterval { return }
+        _ = try? await refreshStorefront()
+    }
+
+    /// After a purchase or a restore, what this account may buy and at what price changed (the trial is used up, a
+    /// win-back offer appeared): a fetch in the background, so the purchase answers without waiting for the store.
+    /// One fetch at a time.
+    func scheduleStorefrontRefresh() {
+        guard storefrontTask == nil, !isTerminated, !isShutDown else { return }
+        storefrontTask = Task { [weak self] in
+            _ = try? await self?.refreshStorefront()
+            self?.storefrontTask = nil
+        }
+    }
+
+    // MARK: Purchases
 
     /// The credit is written before `finish()`: if the app dies in between, `Transaction.updates` re-delivers the
     /// transaction and the deterministic credit id makes the second write a no-op.
@@ -169,6 +226,7 @@ extension GateEngine {
             emit(.purchase(stage: .completed, productID: productID, source: source, transactionID: transaction.id))
             await sync?.requestPull()
             scheduleSync(immediately: true)
+            scheduleStorefrontRefresh()
             return .purchased(transactionID: transaction.id)
         case .pending:
             emit(.purchase(stage: .pending, productID: productID, source: source, transactionID: nil))
@@ -192,12 +250,14 @@ extension GateEngine {
         emit(.restore(stage: .completed))
         await sync?.requestPull()
         await syncNow()
+        scheduleStorefrontRefresh()
     }
 
-    /// Return to foreground: re-resolve and drain the outbox.
+    /// Return to foreground: re-resolve, drain the outbox, and fetch the storefront when the last one is stale.
     public func didBecomeActive() async {
         await refresh(cause: .foreground)
         scheduleSync(immediately: false)
+        await refreshStorefrontIfStale()
     }
 
     // MARK: Connectivity
@@ -225,7 +285,7 @@ extension GateEngine {
 
     /// Drains the outbox now, coalesced to one run per `syncCoalescing` seconds otherwise.
     func scheduleSync(immediately: Bool) {
-        guard sync != nil, !isTerminated else { return }
+        guard sync != nil, !isTerminated, !isShutDown else { return }
         if immediately {
             syncTask?.cancel()
             syncTask = nil
@@ -249,7 +309,7 @@ extension GateEngine {
     /// more, so a caller always sees its own events pushed. Nothing in the gate path waits for this.
     public func syncNow() async {
         while let running = runningSync { await running.value }
-        guard sync != nil, !isTerminated else { return }
+        guard sync != nil, !isTerminated, !isShutDown else { return }
         // The task clears itself before it completes, so a waiter that resumes never sees a finished task
         // (awaiting a finished task does not suspend, and the loop above would spin on the main actor).
         let task = Task {
@@ -261,17 +321,21 @@ extension GateEngine {
     }
 
     private func performSync() async {
-        guard let sync, !isTerminated, hasNetworkPath else { return }
+        // The coalescing timer that led here is spent either way; a stale handle would block the next one.
         syncTask?.cancel()
         syncTask = nil
+        guard let sync, !isTerminated, !isShutDown, hasNetworkPath else { return }
         lastSyncAt = clock.now
         let pending = journal.pendingUpload
         if !pending.isEmpty, let acknowledged = try? await sync.push(pending) {
             let ids = pending.map(\.id).filter(acknowledged.contains)
-            if !ids.isEmpty, !isTerminated { try? journal.append(.uploaded(ids)) }
+            if !ids.isEmpty, !isTerminated, !isShutDown { try? journal.append(.uploaded(ids)) }
         }
-        guard let remote = try? await sync.pull(), !isTerminated else { return }
+        guard let remote = try? await sync.pull(), !isTerminated, !isShutDown else { return }
         merge(remote)
+        settleBaseline(afterPulling: remote)
+        // The carrier has answered: an account with no history anywhere is new.
+        grantWelcomeIfNew()
     }
 
     /// Union merge by id. Carriers only add events, so a merge can never remove a debit.
@@ -295,11 +359,27 @@ extension GateEngine {
         reevaluateSessions()
     }
 
+    /// After a reinstall the Keychain snapshot stands in for the history this install has not seen. Once the
+    /// carrier has answered with events for this account, the snapshot has done its job: if its last event is
+    /// among them the ledger is complete; if not, that event was never uploaded and died with the old install, and
+    /// keeping the snapshot on top of the remote history would count every uploaded credit twice. Either way the
+    /// carrier is the truth from here. A carrier that answers with nothing (iCloud off, empty container) leaves the
+    /// snapshot standing.
+    func settleBaseline(afterPulling remote: [LedgerEvent]) {
+        guard let baseline else { return }
+        let seenLast = baseline.lastEventID.map(ledger.contains) ?? true
+        let answered = remote.contains { $0.accountKey == accountKey || $0.accountKey == unboundAccountKey }
+        guard seenLast || answered else { return }
+        self.baseline = nil
+        recomputeLeasesAndWallet(notify: true)
+        reevaluateSessions()
+    }
+
     func persistSnapshot() {
-        guard let sync else { return }
+        guard let sync, !isShutDown else { return }
         let snapshot = WalletSnapshot(
             accountKey: accountKey, balance: ledger.balance(for: accountKey, baseline: baseline),
-            lastEventID: ledger.events.last?.id, headHash: ledger.head(for: deviceID))
+            lastEventID: ledger.lastEventID, headHash: ledger.head(for: deviceID))
         snapshotTask?.cancel()
         snapshotTask = Task { await sync.saveSnapshot(snapshot) }
     }

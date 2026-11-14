@@ -123,6 +123,26 @@
             #expect(paywall.wallet.balance == 2)  // re-shown within the lease: no second draw
         }
 
+        /// The overload without a denied view renders nothing for a closed gate, and still publishes the denial.
+        @Test func gate_without_a_denied_view_renders_nothing_when_closed() async {
+            let (paywall, _, _) = await makePaywall()
+            let opened = Opened()
+            let window = await Paywall.$override.withValue(paywall) { () async -> NSWindow in
+                let view = Text("content").onAppear { opened.count += 1 }.paywallGated(.paid, id: "pro-only")
+                let window = NSWindow(
+                    contentRect: NSRect(x: 0, y: 0, width: 200, height: 200), styleMask: [.titled], backing: .buffered,
+                    defer: false)
+                window.isReleasedWhenClosed = false
+                window.contentViewController = NSHostingController(rootView: view)
+                window.orderFront(nil)
+                return window
+            }
+            defer { window.close() }
+            await pumpLayout(window)
+            #expect(opened.count == 0)
+            #expect(paywall.pendingFailure?.source.id == "pro-only")
+        }
+
         private func pumpLayout(_ window: NSWindow) async {
             for _ in 0..<20 {
                 window.contentView?.layoutSubtreeIfNeeded()

@@ -71,6 +71,7 @@ var targets: [Target] = [
                 .target(name: "PaywallKit"),
                 .target(name: "PaywallTesting"),
             ],
+            resources: [.copy("Fixtures")],
             swiftSettings: swiftSettings
         ),
         .testTarget(

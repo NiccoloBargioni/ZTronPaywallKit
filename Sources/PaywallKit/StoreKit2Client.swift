@@ -3,7 +3,10 @@ public import PaywallCore
 import StoreKit
 
 /// The production `StoreClient`: a thin, stateless adapter over StoreKit 2. Unverified results never leave it.
-/// Exercised with `SKTestSession` and a StoreKit configuration file in the host's test target.
+/// Exercised with `SKTestSession` and a StoreKit configuration file on the iOS Simulator lane.
+///
+/// Every method is `@concurrent`: StoreKit's own work and the receipt parse run off the caller's actor, so the
+/// main actor's only disk I/O stays the draw path (concurrency requirement 7).
 public struct StoreKit2Client: StoreClient {
     /// The iOS 15 path for the app transaction, and the fallback when `AppTransaction` is unavailable offline.
     public var receipt: ReceiptClient
@@ -12,6 +15,7 @@ public struct StoreKit2Client: StoreClient {
         self.receipt = receipt
     }
 
+    @concurrent
     public func currentEntitlements() async throws -> [StoreTransaction] {
         var transactions: [StoreTransaction] = []
         for await result in Transaction.currentEntitlements {
@@ -20,6 +24,7 @@ public struct StoreKit2Client: StoreClient {
         return transactions
     }
 
+    @concurrent
     public func allTransactions() async throws -> [StoreTransaction] {
         var transactions: [StoreTransaction] = []
         for await result in Transaction.all {
@@ -30,6 +35,7 @@ public struct StoreKit2Client: StoreClient {
 
     /// `AppTransaction.shared` on iOS 16 / macOS 13, verified; otherwise, or when it throws offline, the receipt.
     /// Never refreshes either: both can prompt for an Apple ID password.
+    @concurrent
     public func appTransaction() async throws -> AppTransactionSnapshot? {
         if #available(iOS 16.0, macOS 13.0, *) {
             if let result = try? await AppTransaction.shared, case .verified(let app) = result {
@@ -48,6 +54,7 @@ public struct StoreKit2Client: StoreClient {
         return try receipt.snapshot()
     }
 
+    @concurrent
     public func updates() async -> AsyncStream<StoreTransaction> {
         AsyncStream { continuation in
             let task = Task {
@@ -60,10 +67,40 @@ public struct StoreKit2Client: StoreClient {
         }
     }
 
-    public func products(for ids: Set<String>) async throws -> [PaywallProduct] {
-        try await Product.products(for: ids).map(Self.map)
+    /// Promoted in-app purchases tapped on the App Store (`PurchaseIntent`, iOS 16.4 / macOS 14.4). Older systems
+    /// get a finished stream.
+    @concurrent
+    public func purchaseIntents() async -> AsyncStream<String> {
+        AsyncStream { continuation in
+            if #available(iOS 16.4, macOS 14.4, *) {
+                let task = Task {
+                    for await intent in PurchaseIntent.intents { continuation.yield(intent.product.id) }
+                    continuation.finish()
+                }
+                continuation.onTermination = { _ in task.cancel() }
+            } else {
+                continuation.finish()
+            }
+        }
     }
 
+    /// Each product with its offers, and for a subscription whether this account can still take the introductory one.
+    @concurrent
+    public func products(for ids: Set<String>) async throws -> [PaywallProduct] {
+        var products: [PaywallProduct] = []
+        for product in try await Product.products(for: ids) {
+            var eligibleForIntro: Bool?
+            if let subscription = product.subscription { eligibleForIntro = await subscription.isEligibleForIntroOffer }
+            products.append(Self.map(product, eligibleForIntro: eligibleForIntro))
+        }
+        return products
+    }
+
+    /// `Storefront.current`: the country the prices and offers are for.
+    @concurrent
+    public func storefrontCountryCode() async -> String? { await Storefront.current?.countryCode }
+
+    @concurrent
     public func purchase(productID: String) async throws -> StorePurchaseResult {
         guard let product = try await Product.products(for: [productID]).first else {
             throw StoreClientError.productNotFound(productID)
@@ -79,15 +116,18 @@ public struct StoreKit2Client: StoreClient {
         case .userCancelled:
             return .userCancelled
         @unknown default:
-            return .userCancelled
+            // Fail closed: a result this build does not know is neither a purchase nor a cancellation.
+            throw StoreClientError.unavailable("unknown purchase result")
         }
     }
 
+    @concurrent
     public func sync() async throws {
         try await AppStore.sync()
     }
 
     /// Finds the transaction among the unfinished ones (purchases and updates stay there until finished).
+    @concurrent
     public func finish(transactionID: UInt64) async {
         for await result in Transaction.unfinished {
             if case .verified(let transaction) = result, transaction.id == transactionID {
@@ -97,6 +137,7 @@ public struct StoreKit2Client: StoreClient {
         }
     }
 
+    @concurrent
     public func subscriptionPhase(groupID: String) async throws -> SubscriptionPhase? {
         let statuses = try await Product.SubscriptionInfo.status(for: groupID)
         for status in statuses {
@@ -110,6 +151,7 @@ public struct StoreKit2Client: StoreClient {
         return nil
     }
 
+    @concurrent
     public func isEligibleForIntroOffer(groupID: String) async -> Bool {
         await Product.SubscriptionInfo.isEligibleForIntroOffer(for: groupID)
     }
@@ -134,8 +176,10 @@ public struct StoreKit2Client: StoreClient {
             revocationDate: transaction.revocationDate,
             isUpgraded: transaction.isUpgraded,
             isIntroductoryOffer: transaction.offerType == .introductory,
+            // A transaction does not carry the renewal preference; `subscriptionPhase` reads it on demand.
             willAutoRenew: true,
-            subscriptionGroupID: transaction.subscriptionGroupID)
+            subscriptionGroupID: transaction.subscriptionGroupID,
+            ownership: transaction.ownershipType == .familyShared ? .familyShared : .purchased)
     }
 
     @available(iOS 16.0, macOS 13.0, *)
@@ -147,7 +191,8 @@ public struct StoreKit2Client: StoreClient {
         }
     }
 
-    static func map(_ product: Product) -> PaywallProduct {
+    /// `eligibleForIntro` is `Product.SubscriptionInfo.isEligibleForIntroOffer`, read by the caller (it is async).
+    static func map(_ product: Product, eligibleForIntro: Bool?) -> PaywallProduct {
         let kind: PaywallProduct.Kind
         switch product.type {
         case .autoRenewable:
@@ -160,20 +205,47 @@ public struct StoreKit2Client: StoreClient {
         case .nonConsumable: kind = .lifetime
         default: kind = .tokens(0)  // the engine replaces it with the catalog's pack size
         }
-        var intro: PaywallProduct.IntroOffer?
-        if let offer = product.subscription?.introductoryOffer, offer.paymentMode == .freeTrial {
-            let days: Int
-            switch offer.period.unit {
-            case .day: days = offer.period.value
-            case .week: days = offer.period.value * 7
-            case .month: days = offer.period.value * 30
-            case .year: days = offer.period.value * 365
-            @unknown default: days = offer.period.value
-            }
-            intro = .init(trialDays: days)
+        var offers: [PaywallProduct.Offer] = []
+        if let subscription = product.subscription {
+            if let intro = subscription.introductoryOffer { offers.append(map(intro, kind: .introductory, eligible: eligibleForIntro)) }
+            for offer in subscription.promotionalOffers { offers.append(map(offer, kind: .promotional, eligible: nil)) }
+            // StoreKit lists the win-back offers this account is eligible for, and only those.
+            if #available(iOS 18.0, macOS 15.0, *) { for offer in subscription.winBackOffers { offers.append(map(offer, kind: .winBack, eligible: true)) } }
         }
         return PaywallProduct(
             id: product.id, kind: kind, displayName: product.displayName, description: product.description,
-            displayPrice: product.displayPrice, introOffer: intro)
+            displayPrice: product.displayPrice, price: product.price, currencyCode: product.priceFormatStyle.currencyCode,
+            introOffer: introOffer(among: offers), offers: offers)
+    }
+
+    /// The disclosure's free trial: the introductory offer, when it is a free trial this account can still redeem.
+    static func introOffer(among offers: [PaywallProduct.Offer]) -> PaywallProduct.IntroOffer? {
+        offers.first { $0.kind == .introductory && $0.paymentMode == .freeTrial && $0.isEligible == true }
+            .map { PaywallProduct.IntroOffer(trialDays: $0.totalDays) }
+    }
+
+    static func map(_ offer: Product.SubscriptionOffer, kind: PaywallProduct.Offer.Kind, eligible: Bool?) -> PaywallProduct.Offer {
+        PaywallProduct.Offer(
+            kind: kind, id: offer.id, paymentMode: map(offer.paymentMode), displayPrice: offer.displayPrice, price: offer.price,
+            periodDays: days(of: offer.period), periodCount: offer.periodCount, isEligible: eligible)
+    }
+
+    static func map(_ mode: Product.SubscriptionOffer.PaymentMode) -> PaywallProduct.Offer.PaymentMode {
+        switch mode {
+        case .freeTrial: return .freeTrial
+        case .payUpFront: return .payUpFront
+        default: return .payAsYouGo
+        }
+    }
+
+    /// A StoreKit period in days, the unit the catalog's tiers use: a month counts 30, a year 365.
+    static func days(of period: Product.SubscriptionPeriod) -> Int {
+        switch period.unit {
+        case .day: return period.value
+        case .week: return period.value * 7
+        case .month: return period.value * 30
+        case .year: return period.value * 365
+        @unknown default: return period.value
+        }
     }
 }

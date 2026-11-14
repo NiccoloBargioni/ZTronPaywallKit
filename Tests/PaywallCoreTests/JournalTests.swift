@@ -78,7 +78,7 @@ struct JournalTests {
             try journal.append(.event(event("b"), uploaded: false))
             try journal.append(.uploaded(["a"]))
         }
-        let compacted = try Journal(directory: dir, compactionThreshold: 2)
+        let compacted = try Journal(directory: dir, compactionThreshold: 0)
         #expect(compacted.entries.count == 2)
         #expect(compacted.pendingUpload.map(\.id) == ["b"])
         try compacted.append(.event(event("c"), uploaded: false))
@@ -111,6 +111,178 @@ struct JournalTests {
         #expect(throws: JournalError.self) {
             _ = try Journal(directory: URL(fileURLWithPath: "/dev/null/nope"))
         }
+    }
+
+    // MARK: Checkpoints
+
+    /// Grants on one device stream, each linking to the one before.
+    private struct Chain {
+        var head = paywallGenesisHash
+        mutating func next(_ id: String, tokens: Int = 1) -> LedgerEvent {
+            let next = event(id, tokens: tokens, previous: head)
+            head = next.hash
+            return next
+        }
+    }
+
+    @Test func a_checkpoint_leads_the_log_and_prunes_the_events_it_covers() throws {
+        let dir = makeTemporaryPaywallDirectory()
+        var chain = Chain()
+        let journal = try Journal(directory: dir, fullSync: false)
+        try journal.append(.event(chain.next("a", tokens: 3), uploaded: false))
+        try journal.append(.event(chain.next("b", tokens: 4), uploaded: true))
+        try journal.append(.uploaded(["a"]))
+        try journal.append(.event(chain.next("c", tokens: 5), uploaded: false))
+        let covered = Ledger(events: journal.ledgerEvents).checkpoint()
+        try journal.compact(checkpoint: covered, keepingOutbox: true)
+        // `a` and `b` are acknowledged and counted: gone. `c` is the outbox: kept behind the checkpoint.
+        #expect(journal.entries.count == 2)
+        #expect(journal.entries.first == .checkpoint(covered))
+        #expect(journal.checkpoint == covered)
+        #expect(covered.eventCount == 3)
+        #expect(journal.pendingUpload.map(\.id) == ["c"])
+        #expect(journal.ledgerEvents.map(\.id) == ["c"])
+        try journal.append(.event(chain.next("d", tokens: 6), uploaded: false))
+
+        let reopened = try Journal(directory: dir)
+        #expect(reopened.checkpoint == covered)
+        #expect(reopened.ledgerEvents.map(\.id) == ["c", "d"])
+        #expect(reopened.pendingUpload.map(\.id) == ["c", "d"])
+        let ledger = Ledger(checkpoint: reopened.checkpoint, events: reopened.ledgerEvents)
+        #expect(ledger.events.map(\.id) == ["d"], "the outbox is a replay to the ledger")
+        #expect(ledger.balance(for: "acct") == 18)
+        #expect(ledger.contains("a") && ledger.contains("c") && !ledger.contains("e"))
+        #expect(ledger.head(for: "A") == chain.head)
+        #expect(ledger.firstBrokenLink() == nil)
+        #expect(Ledger(events: [chain.next("e")]).head(for: "A") != ledger.head(for: "A"))
+
+        // Once the carrier acknowledges `c`, the marker compaction drops it; the checkpoint stays in front.
+        try reopened.append(.uploaded(["c"]))
+        try reopened.compact()
+        #expect(reopened.entries.count == 2)
+        #expect(reopened.checkpoint == covered)
+        #expect(reopened.ledgerEvents.map(\.id) == ["d"])
+        #expect(reopened.pendingUpload.map(\.id) == ["d"])
+        #expect(try Journal(directory: dir).ledgerEvents.map(\.id) == ["d"])
+    }
+
+    @Test func without_an_outbox_to_keep_a_checkpoint_covers_the_pending_events_too() throws {
+        let dir = makeTemporaryPaywallDirectory()
+        var chain = Chain()
+        let journal = try Journal(directory: dir, fullSync: false)
+        try journal.append(.event(chain.next("a", tokens: 3), uploaded: false))
+        try journal.append(.event(chain.next("b", tokens: 4), uploaded: false))
+        try journal.compact(checkpoint: Ledger(events: journal.ledgerEvents).checkpoint(), keepingOutbox: false)
+        #expect(journal.entries.count == 1)
+        #expect(journal.pendingUpload.isEmpty)
+        try journal.append(.event(chain.next("c", tokens: 5), uploaded: false))
+        let reopened = try Journal(directory: dir)
+        #expect(reopened.ledgerEvents.map(\.id) == ["c"])
+        #expect(reopened.pendingUpload.map(\.id) == ["c"])
+        #expect(Ledger(checkpoint: reopened.checkpoint, events: reopened.ledgerEvents).balance(for: "acct") == 12)
+    }
+
+    @Test func a_crash_between_the_checkpoint_and_the_rename_keeps_the_old_log() throws {
+        let dir = makeTemporaryPaywallDirectory()
+        var chain = Chain()
+        let events = [chain.next("a", tokens: 3), chain.next("b", tokens: 4)]
+        do {
+            let journal = try Journal(directory: dir, fullSync: false)
+            try journal.append(contentsOf: events.map { .event($0, uploaded: true) })
+        }
+        // The side file is complete, synced even, but the process died before `rename(2)`: it is not the log.
+        let side = URL(fileURLWithPath: dir.appendingPathComponent(Journal.fileName).path + Journal.compactingSuffix)
+        var bytes = try Journal.frame(.checkpoint(Ledger(events: events).checkpoint()))
+        bytes += try Journal.frame(.event(chain.next("c"), uploaded: false))
+        try Data(bytes).write(to: side)
+        let reopened = try Journal(directory: dir)
+        #expect(reopened.checkpoint == nil)
+        #expect(reopened.ledgerEvents.map(\.id) == ["a", "b"])
+        #expect(!FileManager.default.fileExists(atPath: side.path))
+    }
+
+    @Test func a_corrupt_or_torn_checkpoint_drops_the_log_like_any_bad_first_frame() throws {
+        let dir = makeTemporaryPaywallDirectory()
+        var chain = Chain()
+        let url = dir.appendingPathComponent(Journal.fileName)
+        do {
+            let journal = try Journal(directory: dir, fullSync: false)
+            try journal.append(.event(chain.next("a", tokens: 3), uploaded: true))
+            try journal.compact(checkpoint: Ledger(events: journal.ledgerEvents).checkpoint(), keepingOutbox: true)
+            try journal.append(.event(chain.next("b", tokens: 4), uploaded: false))
+        }
+        let intact = try Data(contentsOf: url)
+        let checkpointFrame = try Journal.frame(.checkpoint(Ledger(events: [event("a", tokens: 3, previous: paywallGenesisHash)]).checkpoint())).count
+        #expect(Journal.decodeFrames(intact).0.count == 2)
+
+        // A bit flipped inside the checkpoint's payload: the CRC rejects it, and `b` behind it is unreachable.
+        var corrupt = [UInt8](intact)
+        corrupt[checkpointFrame / 2] ^= 0xFF
+        try Data(corrupt).write(to: url)
+        let afterCorruption = try Journal(directory: dir)
+        #expect(afterCorruption.entries.isEmpty && afterCorruption.checkpoint == nil)
+        #expect(afterCorruption.droppedTailBytes == intact.count)
+        #expect(Ledger(checkpoint: afterCorruption.checkpoint, events: afterCorruption.ledgerEvents).balance(for: "acct") == 0)
+
+        // Cut short inside the checkpoint: a torn first frame, truncated to nothing.
+        try intact.prefix(checkpointFrame - 1).write(to: url)
+        let afterTear = try Journal(directory: dir)
+        #expect(afterTear.entries.isEmpty)
+        #expect(afterTear.droppedTailBytes == checkpointFrame - 1)
+        #expect(try Data(contentsOf: url).isEmpty)
+        // The log is usable again from there.
+        try afterTear.append(.event(chain.next("c", tokens: 5), uploaded: false))
+        #expect(try Journal(directory: dir).ledgerEvents.map(\.id) == ["c"])
+    }
+
+    @Test func the_last_checkpoint_wins() throws {
+        let dir = makeTemporaryPaywallDirectory()
+        var chain = Chain()
+        let journal = try Journal(directory: dir, fullSync: false)
+        let a = chain.next("a", tokens: 3)
+        let first = Ledger(events: [a]).checkpoint()
+        try journal.append(.checkpoint(first))
+        #expect(journal.checkpoint == first)
+        let b = chain.next("b", tokens: 4)
+        try journal.append(.event(b, uploaded: false))
+        #expect(journal.ledgerEvents.map(\.id) == ["b"])
+        let second = Ledger(checkpoint: first, events: [b]).checkpoint()
+        try journal.append(contentsOf: [.checkpoint(second), .event(chain.next("c", tokens: 5), uploaded: false)])
+        #expect(journal.checkpoint == second)
+        #expect(journal.ledgerEvents.map(\.id) == ["c"])
+        let reopened = try Journal(directory: dir)
+        #expect(reopened.checkpoint == second)
+        #expect(reopened.ledgerEvents.map(\.id) == ["c"])
+        let ledger = Ledger(checkpoint: reopened.checkpoint, events: reopened.ledgerEvents)
+        #expect(ledger.balance(for: "acct") == 12)
+        #expect(ledger.lastEventID == "c")
+        #expect(second.eventCount == 2 && second.lastEventID == "b")
+    }
+
+    @Test func a_checkpoint_round_trips_through_its_frame_and_refuses_another_version() throws {
+        var chain = Chain()
+        var ledger = Ledger(events: [chain.next("grant:1", tokens: 10)])
+        ledger.append(
+            LedgerEvent(
+                id: "debit:1", at: Date(timeIntervalSince1970: 1_000), deviceID: "A", accountKey: "acct",
+                source: PaywallSource(id: "g", fileID: "f", function: "t", line: 1), previousHash: ledger.head(for: "A"),
+                kind: .debit(tokens: 2, leaseUntil: Date(timeIntervalSince1970: 1_300))))
+        let checkpoint = ledger.checkpoint()
+        let (decoded, length) = Journal.decodeFrames(Data(try Journal.frame(.checkpoint(checkpoint))))
+        #expect(decoded == [.checkpoint(checkpoint)])
+        #expect(length == (try Journal.frame(.checkpoint(checkpoint))).count)
+
+        let json = String(decoding: try CanonicalJSON.encoder().encode(checkpoint), as: UTF8.self)
+        #expect(json.contains("\"version\":1"))
+        #expect(json.contains("\"ids\":[\"grant:1\"]"), "debit ids are stored with their debits only")
+        let decoder = CanonicalJSON.decoder()
+        #expect(try decoder.decode(LedgerCheckpoint.self, from: Data(json.utf8)) == checkpoint)
+        let newer = json.replacingOccurrences(of: "\"version\":1", with: "\"version\":2")
+        #expect(throws: DecodingError.self) { try decoder.decode(LedgerCheckpoint.self, from: Data(newer.utf8)) }
+        #expect(json.contains("\"debits\":[[\"debit:1\",2,0,1000,1300,\"g\"]]"), "a debit is stored as an array, its account as an index")
+        let unknownAccount = json.replacingOccurrences(of: "[\"debit:1\",2,0,", with: "[\"debit:1\",2,7,")
+        #expect(unknownAccount != json)
+        #expect(throws: DecodingError.self) { try decoder.decode(LedgerCheckpoint.self, from: Data(unknownAccount.utf8)) }
     }
 }
 
