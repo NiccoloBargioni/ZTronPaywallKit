@@ -344,3 +344,132 @@ struct ReceiptSignatureTests {
         }
     #endif
 }
+
+private let productionReceiptPath = ProcessInfo.processInfo.environment["PAYWALL_PRODUCTION_RECEIPT"]
+
+/// A production receipt of the app under test, when `PAYWALL_PRODUCTION_RECEIPT` names one. An App Store install
+/// keeps it at `Bundle.main.appStoreReceiptURL`; for an iOS app on an Apple silicon Mac that is
+/// `~/Library/Containers/<bundle id>/Data/StoreKit/receipt`. It is Apple's real output, so the verifier, the parser,
+/// the grandfathering rule and the engine run over it, with expectations taken from the receipt itself. A receipt
+/// names its app, so none is committed and CI skips the suite.
+@Suite("Production receipt", .enabled(if: productionReceiptPath != nil, "set PAYWALL_PRODUCTION_RECEIPT to an App Store receipt file"))
+struct ProductionReceiptTests {
+    static let day: TimeInterval = 86_400
+
+    static func receipt() throws -> Data { try Data(contentsOf: URL(fileURLWithPath: try #require(productionReceiptPath))) }
+    static func snapshot() throws -> AppTransactionSnapshot { try #require(try ReceiptClient.parse(try receipt())) }
+
+    /// The receipt's own build is the last paid one, bought a year into the paid window, freemium a month later.
+    /// A build called `1.0` is also what the sandbox reports, so it needs the sentinel.
+    static func policy(_ snapshot: AppTransactionSnapshot) -> GrandfatheringPolicy {
+        let paid = DateInterval(
+            start: snapshot.originalPurchaseDate.addingTimeInterval(-365 * day),
+            end: snapshot.originalPurchaseDate.addingTimeInterval(30 * day))
+        return GrandfatheringPolicy(
+            lastPaidBuild: snapshot.originalAppVersion, paidWindow: paid,
+            legacySentinel: snapshot.originalAppVersion == "1.0" ? .init(onSaleWindow: paid) : nil)
+    }
+
+    @Test func apple_signed_it_and_the_test_root_did_not() throws {
+        let receipt = try Self.receipt()
+        #expect(AppleReceiptVerifier().isAuthentic(receipt))
+        #expect(!AppleReceiptVerifier(anchors: [ReceiptSignatureTests.testRoot]).isAuthentic(receipt))
+        let model = try #require(SignedReceipt(receipt))
+        #expect(model.signers.count == 1)
+        #expect(model.certificates.count >= 2)  // the signer and at least the intermediate
+        #expect(model.certificates.filter { AppleReceiptVerifier.hasExtension(AppleReceiptVerifier.receiptSigningMarker, in: $0) }.count == 1)
+        // Apple's layout: no signed attributes, RSA PKCS#1 v1.5 straight over the payload.
+        #expect(model.signers.first?.signedAttributes == nil)
+        #expect(model.signers.first?.signatureAlgorithm == "1.2.840.113549.1.1.1")
+        // One payload byte changed: the parser still reads it, the verifier refuses it.
+        let snapshot = try Self.snapshot()
+        var tampered = receipt
+        let bundle = try #require(receipt.range(of: Data(snapshot.bundleID.utf8)))
+        tampered[bundle.lowerBound] ^= 0x01
+        #expect(try ReceiptClient.parse(tampered)?.bundleID != snapshot.bundleID)
+        #expect(!AppleReceiptVerifier().isAuthentic(tampered))
+    }
+
+    @Test func parses_what_the_rule_uses_and_the_client_binds_it_to_its_app() throws {
+        let receipt = try Self.receipt()
+        let snapshot = try Self.snapshot()
+        #expect(snapshot.environment == .production)
+        #expect(!snapshot.bundleID.isEmpty)
+        #expect(!snapshot.originalAppVersion.isEmpty)
+        #expect(snapshot.originalPurchaseDate < Date())
+        #expect(snapshot.origin == .receipt)
+        #expect(snapshot.appTransactionID == nil)
+        #expect(snapshot.signedPayload == receipt)
+        let fields = try ReceiptClient.receiptFields(receipt)
+        #expect(fields[0].flatMap(ASN1.string) == "Production")
+        let created = try #require(fields[12].flatMap(ASN1.string).flatMap(ReceiptClient.parseDate))  // the chain is evaluated at it
+        #expect(created >= snapshot.originalPurchaseDate)
+        // The iOS 15 path and the iOS 16 path derive one account key from the same three values.
+        let fromAppTransaction = AppTransactionSnapshot(
+            bundleID: snapshot.bundleID, originalAppVersion: snapshot.originalAppVersion,
+            originalPurchaseDate: snapshot.originalPurchaseDate, environment: .production, appTransactionID: "1", origin: .appTransaction)
+        #expect(snapshot.accountKey == fromAppTransaction.accountKey)
+        // The client, with the production verifier, reads it for its app and for no other.
+        let url = makeTemporaryPaywallDirectory().appendingPathComponent("receipt")
+        try receipt.write(to: url)
+        #expect(try ReceiptClient(receiptURL: url, expectedBundleID: snapshot.bundleID).snapshot() == snapshot)
+        #expect(try ReceiptClient(receiptURL: url, expectedBundleID: "com.ztron.app").snapshot() == nil)
+        print("production receipt: \(snapshot.bundleID) build \(snapshot.originalAppVersion), bought \(snapshot.originalPurchaseDate), created \(created)")
+    }
+
+    @Test func the_rule_admits_it_inside_the_paid_window_and_the_resolver_grants_from_it() throws {
+        let snapshot = try Self.snapshot()
+        let policy = Self.policy(snapshot)
+        #expect(policy.admits(snapshot))
+        // Freemium went live a second before this purchase: a free-era install, whatever its build.
+        var freemiumEarlier = policy
+        freemiumEarlier.paidWindow = DateInterval(start: policy.paidWindow.start, end: snapshot.originalPurchaseDate.addingTimeInterval(-1))
+        #expect(!freemiumEarlier.admits(snapshot))
+        // The last paid build was "0": this one is a freemium build.
+        var lastPaidZero = policy
+        lastPaidZero.lastPaidBuild = "0"
+        #expect(!lastPaidZero.admits(snapshot))
+        // Production only, by default.
+        var sandboxOnly = policy
+        sandboxOnly.environments = [.sandbox]
+        #expect(!sandboxOnly.admits(snapshot))
+        let now = policy.paidWindow.end.addingTimeInterval(Self.day)  // the day after freemium went live
+        let lifetime = EntitlementResolver(catalog: catalog, grandfathering: policy).resolve(transactions: [], appTransaction: snapshot, now: now)
+        #expect(lifetime.entitlement == .lifetime(.grandfathered(originalAppVersion: snapshot.originalAppVersion)))
+        #expect(lifetime.entitlement.tier(wallet: .empty) == .grandfathered)
+        #expect(lifetime.grandfathered == snapshot)
+        #expect(lifetime.expiresAt == nil)
+        var tokens = policy
+        tokens.grant = .tokens(50)
+        let free = EntitlementResolver(catalog: catalog, grandfathering: tokens).resolve(transactions: [], appTransaction: snapshot, now: now)
+        #expect(free.entitlement == .free)
+        #expect(free.grandfathered == snapshot)  // the ledger grants the tokens from this, once per account
+        let none = EntitlementResolver(catalog: catalog, grandfathering: nil).resolve(transactions: [], appTransaction: snapshot, now: now)
+        #expect(none.entitlement == .free)
+        #expect(none.grandfathered == nil)
+    }
+
+    /// End to end: a store reporting this app transaction opens every gate as a grandfathered lifetime.
+    @MainActor
+    @Test func a_facade_fed_this_app_transaction_is_grandfathered() async throws {
+        let snapshot = try Self.snapshot()
+        let paywall = Paywall()
+        let audit = InMemoryAuditSink()
+        var configuration = Paywall.Configuration(catalog: catalog)
+        configuration.grandfathering = Self.policy(snapshot)
+        configuration.welcomeTokens = 0
+        configuration.store = FakeStore(app: snapshot, products: products)
+        configuration.storageDirectory = makeTemporaryPaywallDirectory()
+        configuration.includesDefaultAudit = false
+        configuration.connectivity = nil
+        configuration.audit = [audit]
+        paywall.configure(configuration)
+        await paywall.waitUntilStarted()
+        await settle()
+        #expect(paywall.entitlement == .lifetime(.grandfathered(originalAppVersion: snapshot.originalAppVersion)))
+        #expect(paywall.canPass(.paid))
+        let events = await audit.events
+        #expect(events.contains(.grandfathered(
+            originalAppVersion: snapshot.originalAppVersion, originalPurchaseDate: snapshot.originalPurchaseDate, environment: .production)))
+    }
+}

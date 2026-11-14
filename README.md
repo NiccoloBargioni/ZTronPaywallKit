@@ -559,18 +559,32 @@ expired signer with and without a creation date, a leaf without the marker, anot
 discarded; only the root certificate and the receipts are kept. The verifier is pointed at that root in tests
 and at the Apple Root CA in production.
 
-A real **production receipt** for the grandfathering fixtures can only come from a device with an App
-Store install of the paid app. The ways to get one, in order of usefulness:
+A real **production receipt** of your app runs through the same checks, and then the grandfathering rule, when
+`PAYWALL_PRODUCTION_RECEIPT` names it. `ProductionReceiptTests` verifies it against the embedded Apple Root CA,
+parses it, derives a policy from its own build and purchase date, and checks that the rule, the resolver and a
+configured facade admit it, that the rule refuses it once the paid window ends before the purchase, and that one
+changed payload byte is refused. A receipt names its app, so none is committed and CI skips the suite:
 
-1. Any Mac App Store app you own has an Apple-production-signed receipt at
+```bash
+PAYWALL_PRODUCTION_RECEIPT=/path/to/receipt swift test --filter ProductionReceiptTests
+```
+
+Such a receipt can only come from an App Store install of the paid app. The ways to get one, in order of
+usefulness:
+
+1. Install the app from the Mac App Store on an Apple silicon Mac: an iOS app keeps its receipt at
+   `~/Library/Containers/<bundle id>/Data/StoreKit/receipt`, root-owned, so copy it with `sudo`. It carries your
+   bundle id and the build that Apple Account first bought, at that account's purchase date: a fresh purchase
+   proves the format and the rule, not an old customer's history.
+2. Any Mac App Store app you own has an Apple-production-signed receipt at
    `/Applications/<App>.app/Contents/_MASReceipt/receipt`. It proves the signature chain and the parser against
    Apple's real output (the test suite does this on the machine it runs on) but carries that app's bundle id and
    marketing version, so it cannot stand in for your app's fixture.
-2. Ship a support export in the freemium build: a hidden action that shares `Bundle.main.appStoreReceiptURL`'s
+3. Ship a support export in the freemium build: a hidden action that shares `Bundle.main.appStoreReceiptURL`'s
    contents and `AppTransaction.shared`'s `jwsRepresentation` through the share sheet. A paid-era user, or your
    own device that bought the paid version from the App Store, then sends both. A TestFlight build of the same gives a
    sandbox receipt (`original_application_version` `1.0`), which is the fixture for the sentinel cases.
-3. Xcode's Devices window → Download Container works only for development-signed builds and yields the StoreKit
+4. Xcode's Devices window → Download Container works only for development-signed builds and yields the StoreKit
    Testing receipt, which `AppleReceiptVerifier` correctly rejects.
 
 Apple does not publish downloadable receipts, and the App Store Server API has no endpoint for them.
