@@ -138,6 +138,11 @@
       ]
     }
   ],
+  "subscriptionOffersKeyPair" : {
+    "id" : "TESTKEY123",
+    "privateKey" : "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgLAGlSc5xsQ+L0nZ9DQQ1HgX5tSvhI1GqKQia1DwYxMqhRANCAARWiYMGQTuxEejBoxgddOkviENyTCpxb8xjabVvg9kUGZNSF62bCGsgSv7s2vlLgfsCs0/pmbVwd0Dndspof3ih",
+    "publicKey" : "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEVomDBkE7sRHowaMYHXTpL4hDckwqcW/MY2m1b4PZFBmTUhetmwhrIEr+7Nr5S4H7ArNP6Zm1cHdA53bKaH94oQ=="
+  },
   "version" : {
     "major" : 3,
     "minor" : 0

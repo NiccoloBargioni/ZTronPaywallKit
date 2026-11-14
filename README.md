@@ -1,621 +1,275 @@
-# ztron-paywall-kit
+# ZTronPaywallKit
 
-A freemium paywall package for an iOS app moving from paid up front to freemium.
-StoreKit 2 is the only authority. Entitlements live in memory and are re-resolved on launch, foreground and
-`Transaction.updates`. Tokens live in an append-only, hash-chained, crash-safe ledger. Every gate decision is
-audited.
+A freemium paywall for iOS apps, as a Swift package: gates in code and in SwiftUI, a token wallet, subscriptions and a
+lifetime purchase through StoreKit 2, grandfathering for the installs that paid up front, promotional offers signed by
+a server you deploy, optional cross-device sync, a simulator for debug builds and fakes for tests. This page is the
+outside view: what the package promises, how to adopt it, what it exposes, what can go wrong. How it works inside is
+in [HANDBOOK.md](HANDBOOK.md).
 
-Swift 6 language mode, tools 6.0, iOS 15. macOS is not supported: the `.macOS(.v12)` entry in `Package.swift`
-only lets the Mac build and run `swift test` as the development host, and the AppKit hosting in four test files
-exists for that lane alone; nothing ships for or is measured on macOS. Nothing in the package uses
-`@unchecked Sendable`, `nonisolated(unsafe)`, `@preconcurrency`, Dispatch or locks.
+## Intent
 
-## Products
+An app that was paid up front and is going freemium needs four things at once: a way to keep paying customers whole
+(App Review 3.1.2(a)), gates that cannot leak value (a feature delivered without a payment, or a token spent twice),
+a store layer that treats StoreKit 2 as the only authority on who paid, and enough evidence to settle a dispute.
+ZTronPaywallKit is that, and only that. It draws no paywall screen, holds no product copy and makes no routing
+decision; those stay in the app, which calls one facade.
 
-Products are what a `Package.swift` depends on; the module you `import` is the target name.
+What it guarantees:
 
-| Product | Module | Platforms | What it is |
-|---|---|---|---|
-| `ZTronPaywallCore` | `PaywallCore` | Darwin + Linux | Gate engine, ledger, journal, resolver, reconciler, audit. No UI and no StoreKit. |
-| `ZTronPaywallKit` | `PaywallKit` | Darwin | `Paywall` facade, `withPaywall`, `.paywallGated`, signals, StoreKit 2 client, receipt verifier. |
-| `ZTronPaywallCloudSync` | `PaywallCloudSync` | Darwin | CloudKit ledger carrier and Keychain wallet snapshot. |
-| `ZTronPaywallSimulator` | `PaywallSimulator` | Darwin, `DEBUG` only | Presets, launch arguments, preview modifier. |
-| `ZTronPaywallTesting` | `PaywallTesting` | Darwin + Linux | `FakeStore`, `FakeClock`, `FakeConnectivity`, in-memory sinks and carriers. |
+- **StoreKit 2 decides entitlements.** They are re-resolved on launch, on foreground and on every transaction update,
+  from verified transactions. Nothing in the package can grant a subscription or a lifetime unlock on its own.
+- **Value is never delivered without a durable debit.** A token gate writes the debit to disk before the gated code
+  runs; a crash at any step leaves the ledger consistent at the next launch, and a gated body that throws gets its
+  draw reversed.
+- **Every decision is on the record.** Each gate decision, purchase, restore and entitlement change is published once
+  as an event and written to an audit log that can be verified and exported.
+- **Nothing secret ships in the app.** Promotional offers are signed by a server (a Cloudflare Worker in this
+  repository) that holds the In-App Purchase key; the app holds only its URL. See [Secrets](#secrets).
+- **Debug tooling compiles to nothing in release.** Presets, launch arguments and overrides live in a module that is
+  empty in release builds, and a script fails the build if a shipping module contains any of it.
 
-## Setup
+Platforms: iOS 15 and later, Swift 6 language mode, SwiftUI first with one UIKit bridge. macOS only builds and runs the
+unit tests; Linux builds the engine and the fakes. Products and the modules they import:
+
+| Product | `import` | What it is |
+|---|---|---|
+| `ZTronPaywallKit` | `PaywallKit` (+ `PaywallCore`) | The app-facing package: facade, gates, signals, StoreKit 2, receipts. |
+| `ZTronPaywallCore` | `PaywallCore` | The engine without UI or StoreKit, for apps that bring their own store client. |
+| `ZTronPaywallCloudSync` | `PaywallCloudSync` | Token ledger sync through CloudKit, with a Keychain snapshot for reinstalls. |
+| `ZTronPaywallSimulator` | `PaywallSimulator` | Debug builds only: presets, launch arguments, preview support. |
+| `ZTronPaywallTesting` | `PaywallTesting` | Fakes for the store, the clock, the network, the signer and the cloud. |
+
+## Adoption
 
 ```swift
-import PaywallKit
-
-let catalog = ProductCatalog(
-    subscriptionGroupID: "21000000",                 // App Store Connect's numeric group id, as StoreKit reports it
-    weekly: "pro.weekly", monthly: "pro.monthly", yearly: "pro.yearly",
-    lifetime: "pro.lifetime",
-    tokenPacks: [TokenPack(productID: "tokens.10", tokens: 10), TokenPack(productID: "tokens.50", tokens: 50)])
-
-var configuration = Paywall.Configuration(catalog: catalog)
-configuration.grandfathering = GrandfatheringPolicy(
-    lastPaidBuild: "116", paidWindow: DateInterval(start: launch, end: freemiumDay))
-configuration.familySharing = .sharedEntitlements   // or .purchaserOnly; see Family Sharing
-configuration.welcomeTokens = 100                    // the default: once per account; see Welcome tokens
-configuration.sync = PaywallCloudSync()              // optional: ZTronPaywallCloudSync
-Paywall.shared.configure(configuration)
+// Package.swift
+.package(url: "https://github.com/<owner>/ZTronPaywallKit.git", branch: "main"),   // pin a tag once released
+// target dependencies
+.product(name: "ZTronPaywallKit", package: "ZTronPaywallKit"),
+.product(name: "ZTronPaywallCloudSync", package: "ZTronPaywallKit"),               // optional
 ```
 
-`configure` validates the catalog and opens the journal synchronously, so the wallet is known before the
-first frame. If the catalog is invalid or the journal can't be opened, `configurationError` is set and every
-gate except `.free` fails closed.
-
-`configuration.connectivity` defaults to `NetworkPathConnectivity` (NWPathMonitor). The outbox drains only
-while a network path exists, and immediately when one returns. On iOS 15–16 and macOS 12–13 the monitor can
-only report on a dispatch queue, which the package doesn't use, so there the outbox relies on its other
-triggers: launch, foreground, purchase and the 30-second timer.
-
-To test grandfathering on a device (TestFlight and the sandbox can't reach it), debug builds have
-`configuration.grandfatherOverride = GrandfatherOverride(originalAppVersion:originalPurchaseDate:)`. It changes
-only what the resolver sees; the account key, and with it the wallet, still come from the real AppTransaction.
-It's compiled out of release builds.
-
-### Production or fake, chosen at the root
-
-`PaywallServiceProvider` is the one object the main page holds for the paywall: a `@StateObject` that runs the
-production implementation or a fake one, installed on the root with `.paywallProvider(_:)` so every child finds it,
-and the facade, in the environment. The fake is the production engine on a stand-in store (the simulator's switches,
-or a `FakeStore` in a test); only the store, the clock, the sync carrier and the storage location differ, so both
-implementations are a `Paywall.Configuration`: `.production(configuration)` or `.fake(configuration)`. Debug builds
-add `.simulated(_:catalog:)` and `.fromLaunchArguments(production:)` from `ZTronPaywallSimulator`.
-
 ```swift
+import PaywallCore
+import PaywallKit
+import SwiftUI
+
 @main
-struct ZTronApp: App {
-    static var configuration: Paywall.Configuration { /* the configuration above */ }
-    #if DEBUG
-        // Production unless a `-paywall.*` launch argument is present (UI tests), then the simulated fake.
-        @StateObject private var paywall = PaywallServiceProvider(.fromLaunchArguments(production: Self.configuration))
-    #else
-        @StateObject private var paywall = PaywallServiceProvider(.production(Self.configuration))
-    #endif
+struct MyApp: App {
+    static var configuration: Paywall.Configuration {
+        let catalog = ProductCatalog(
+            subscriptionGroupID: "21000000",                                  // the group id as App Store Connect shows it
+            weekly: "pro.weekly", monthly: "pro.monthly", yearly: "pro.yearly",
+            lifetime: "pro.lifetime",
+            tokenPacks: [TokenPack(productID: "tokens.10", tokens: 10)])
+        var configuration = Paywall.Configuration(catalog: catalog)
+        configuration.grandfathering = GrandfatheringPolicy(                    // installs that paid up front keep access
+            lastPaidBuild: "116", paidWindow: DateInterval(start: launchDate, end: freemiumDate))
+        configuration.sync = PaywallCloudSync()                                 // optional: tokens follow the account
+        configuration.promotionalOfferSigner = RemotePromotionalOfferSigner(   // optional: promotional offers
+            endpoint: URL(string: "https://<your signer>/v1/promotional-offers/sign")!)
+        return configuration
+    }
+
+    @StateObject private var paywall = PaywallServiceProvider(.production(Self.configuration))
 
     var body: some Scene {
         WindowGroup {
             RootView()
-                .paywallSheet { failure in PaywallScreen(failure) }
+                .paywallSheet { failure in PaywallScreen(failure) }   // your screen, shown when a gate closes
                 .paywallProvider(paywall)
         }
     }
 }
 
-struct AccountBadge: View {
-    @EnvironmentObject private var paywall: Paywall                   // entitlement, wallet, purchase(_:)
-    @EnvironmentObject private var provider: PaywallServiceProvider   // which implementation
-    var body: some View {
-        if provider.isFake { Text("SIMULATED") }
-    }
-}
+// Gate code: `.blocked` is a value, not an error. Tokens are drawn before `export()` runs.
+let outcome = withPaywall(.tokens(1), id: "export") { export() }
 
-// A debug menu: switch at runtime. The methods return the provider, so they chain.
-provider.useSimulated(.lifetime)                 // on the production catalog and grandfathering policy, see below
-provider.useSimulated(PaywallSimulation(.tokens5), catalog: catalog)
-provider.useFake(configuration)                  // any configuration whose store is a stand-in
-provider.useProduction()                         // back to the production configuration the provider saw last
-provider.use(.fromLaunchArguments(production: configuration))
-```
+// Gate a view: shows nothing (or `denied`) until the user is entitled.
+PremiumChart().paywallGated(.paid)
 
-The provider drives `Paywall.shared`, never a second facade (two facades is how a claim gets lost): its initialiser
-calls `configure` at once, so the journal is open and the wallet known before the first frame, and every `use` method
-configures again, tearing the previous engine down first. `productionConfiguration` is the production configuration
-it saw last (from `init` or `useProduction(_:)`): `useProduction()` returns to it, and `useSimulated` takes the catalog
-and the grandfathering policy from it unless given others. `.paywallProvider` also does what `.paywallLifecycle()` does:
-`\.paywallEntitlement` kept current and a re-resolution whenever the scene becomes active. `PaywallHostingController`
-re-injects the provider under UIKit layers next to the facade (`Paywall.shared.provider` is the same object), and
-`.paywallSimulation(_:)` installs one in previews, so a child declaring `@EnvironmentObject var provider` renders
-there too.
-
-### Progressive adoption
-
-`configuration.passthrough = true` switches the whole mechanism off, for the builds that ship with the gates in
-place before the freemium launch. Nothing starts: no engine, journal, store call, sync or audit. Every gate passes
-as `.free` (`withPaywall`, `evaluate`, `canPass`, `.paywallGated`), `purchase(_:)` answers
-`.purchased(transactionID: 0)` without a payment, `products()` is empty, `restorePurchases()` returns, and nothing
-is published, so no sheet ever shows. `Paywall.isPassthrough` says so; `entitlement` stays `.unknown` and `wallet`
-`.empty`, so an account screen branches on the flag rather than on them. The catalog is only logged, not enforced,
-until the toggle flips. Default `false`; flip it by calling `configure` again.
-
-## Catalog and storefront
-
-`ProductCatalog` declares, in code, every product the app has ever sold: the subscription group id, the `weekly`,
-`monthly` and `yearly` plans (each optional: leave `monthly` out to never offer one), the `lifetime` non-consumable
-and the `tokenPacks` with their sizes. The catalog is the authority on what a product *is*: StoreKit does not know a
-pack's size, nor which plan is which tier, and resolution looks every transaction up here, so a product sold once
-stays declared for as long as a customer may hold a transaction for it. `mismatches(withStoreKitConfiguration:)`
-keeps the catalog in step with the `.storekit` file and App Store Connect.
-
-What the paywall *offers* is the storefront's subset of the catalog. `PaywallStorefront` is what the App Store
-sells right now: every declared product the store returned, in catalog order, each with `displayPrice`, the `price`
-and `currencyCode` behind it, and its `offers`: the introductory offer, the promotional offers and, on iOS 18, the
-win-back offers this account is eligible for, each with its payment mode, period, price and, where StoreKit can say,
-eligibility. `unavailableProductIDs` lists the declared products the store did not return (removed from sale, not
-approved yet, not sold in this storefront) and `countryCode` the storefront the prices are for.
-
-The engine keeps it current on its own. It is fetched at launch and on every return to the foreground when the last
-fetch is older than `configuration.storefrontRefreshInterval` (an hour by default), at once after a purchase or a
-restore (the trial is used up, a win-back offer may have appeared), and on demand with `refreshStorefront()`. The last
-fetch is kept next to the journal, so `Paywall.storefront` is populated before a launch's first fetch answers, and a
-fetch that changes the listing (a product, a price, an offer, the country) is published as `.storefrontChanged`.
-`products()` is the screen-facing shortcut: a fetch, or offline the last storefront with `priceAsOf` set and
-`isPurchasable` false.
-
-Opting out of a plan has two forms. Without a release, remove it from sale in App Store Connect: the store stops
-returning it, the storefront drops it, and existing subscribers keep renewing and keep resolving through the
-catalog. In code, add it to `catalog.retired`: still declared, so its transactions resolve and credit, never listed.
-Dropping a product from the catalog altogether is only right for one that was never sold, because a transaction the
-catalog does not know resolves to nothing.
-
-```swift
-let catalog = ProductCatalog(
-    subscriptionGroupID: "21000000", weekly: "pro.weekly", monthly: "pro.monthly", yearly: "pro.yearly",
-    lifetime: "pro.lifetime", tokenPacks: packs,
-    retired: ["pro.monthly"])                        // sold before, honoured, no longer offered
-
-if let storefront = Paywall.shared.storefront {   // @Published, kept current by the engine
-    let current = Paywall.shared.tier ?? .free
-    for product in storefront.products where product.tier > current { show(product) }
-    for offer in storefront.product("pro.yearly")?.offers ?? [] where offer.isEligible != false { show(offer) }
-}
-```
-
-Redeeming an offer: the introductory offer applies by itself at purchase. A promotional offer needs a signature
-from the app's server, and a win-back offer the purchase option StoreKit added in iOS 18; `purchase(_:)` passes
-neither yet (see Not in this package). The storefront models both so the screen can show them.
-
-## Tiers
-
-`AccessTier` puts what the user has on one scale, lowest first:
-`.free < .freeTrial < .tokens < .weekly < .monthly < .yearly < .lifetime < .grandfathered`. The declaration order is
-the order (`Comparable`, `rank`). `Paywall.tier` and `GateEngine.tier` derive it from the entitlement and the wallet:
-a free user with a positive balance is `.tokens`, a subscription in its free trial is `.freeTrial` whatever its
-period, a lifetime purchase bought or family-shared is `.lifetime`, a grandfathered install `.grandfathered`, and
-`nil` stands for an unknown entitlement. `PaywallProduct.tier` names the tier a product buys, so a screen offers
-what ranks above the current one. `SubscriptionTier` (`.weekly < .monthly < .yearly`) is the billing period of a
-plan, not the user's standing. Gates never read tiers: `GateEngine.decide` does, and a trial opens `.paid` gates
-like any subscription.
-
-## Welcome tokens
-
-`configuration.welcomeTokens` (100 by default, `0` for none) is granted once per account to try the app, as the
-ledger event `grant:welcome` carrying the amount of the build that wrote it. Being a ledger event, a later build
-with another amount changes nothing for existing users: their balance stays what their first build granted, less
-what they spent, and the deterministic id makes any second attempt a no-op on every device.
-
-When it is written depends on what can know the account is new. Without a carrier, at the first launch, right after
-the launch resolution. With `sync` set, after the carrier's first answer, so a new device of an existing account
-takes the account's grant, whatever its own build would give, rather than writing its own, and an account with
-history but no welcome grant (from before the feature) gets none. An offline first launch with a carrier shows the
-tokens once the first pull answers. A device with no iCloud account is told so by the carrier
-(`CloudDatabaseError.noAccount`) and grants on its own, as if it had none; signed in later, it uploads that grant
-like any event, and should the account already hold another build's grant from another device, the ids collide and
-each device keeps the one it wrote. A reinstall whose Keychain snapshot stands in for history is not a new account
-either. Without any carrier the package has no memory of the account beyond StoreKit, so a delete-and-reinstall
-grants again, as any local trial would.
-
-## Gating
-
-```swift
-// Synchronous, main actor: decide, draw write-ahead, run, audit.
-let outcome = withPaywall(.tokens(2), id: "export") { exportPDF() }
-
-// Async, inherits the caller's isolation (SE-0420).
-let value = await withPaywall(.paid, id: "heatmap") { await renderHeatmap() }
-
-// Views: hold on appear, consume on commit, release on disappear (`.reserve`), or draw on appear (`.deductNow`).
-MapView()
-    .paywallGated(.tokens(1), id: "map") { failure in LockedMapView(failure) }
-
-// Inside a gated view, commit the reservation:
-@Environment(\.paywallGate) var gate
-gate?.withPaywall { solve() }
-
-// Or handle the outcome in place. Both handlers return the outcome, so they chain off any of the calls above.
-withPaywall(.tokens(2), id: "export") { exportPDF() }
-    .onExecuted { url in share(url) }
-    .onBlocked { failure in failure.claim(); showUpsell(failure) }   // claim it, or the sheet shows it too
-```
-
-Each `.tokens(n)` draw grants a lease of `tolerance` seconds (300 by default) on that gate id. Re-opening
-the same gate inside the lease costs nothing. A `.deductNow` view that drew stays `.drawn` for as long as it is
-on screen; its own lease is what keeps it open on later evaluations, and nothing logs a second open for it.
-
-The denied view receives the same `PaywallFailure` value the engine published, so `failure.claim()` from inside
-it stops the global sheet, and `PaywallFailureKey` carries one value per closed spell rather than one per render.
-
-## Signals
-
-A denial is offered to handlers first (claim), then falls back to the coordinator:
-
-```swift
-RootView()
-    .paywallSheet { failure in PaywallScreen(failure) }      // unclaimed failures, end of turn
-    .onPaywallFailure(in: "maps") { failure in               // scoped handler; claim() to stop the fallback
-        failure.claim(); showInlineUpsell()
-    }
-    .onPurchaseIntent { productID in                         // a promoted in-app purchase tapped on the App Store
-        showPaywall(highlighting: productID)
-    }
-```
-
-`.paywallSheet` consumes `pendingFailure` when it takes a denial, so two installed sheets never show one. Install
-it on the outermost root and on any root that is itself presented modally (a `.sheet`, a UIKit `present`); nested
-roots inside one presentation pass `presentsPaywall: false`. The deepest installed presenter that can present
-takes the denial, so the sheet inside a presented sheet shows it rather than the root under it, which cannot
-present a second sheet. Behind a plain sheet with no presenter inside, the denial stays pending and the root takes
-it once that sheet goes (SwiftUI's own "next sheet" queue is not relied on; it drops sheets). Both cases are in
-the boundary tests.
-
-Also available: `PaywallFailureKey` (preference), `Paywall.shared.events` (Combine), `eventStream`
-(`AsyncStream`), `purchaseIntents` (Combine), `bridgeToNotificationCenter()`, and `.paywallLifecycle()` for
-scenes without a sheet. On iOS, `PaywallHostingController` provides presence and `paywallFailures` /
-`presentPaywall` to UIKit.
-
-For `NotificationCenter` code, `bridgeToNotificationCenter()` (or `configuration.notificationCenter = .default`, which
-keeps the bridge for the facade's lifetime) posts every event as `.paywallEvent`, and the paywall and purchase events
-under their own names with the payload in `userInfo`, keyed by `PaywallNotificationKey`: `.paywallDenied`
-(`failure`), `.paywallEntitlementChanged` (`entitlement`, `previousEntitlement`, `cause`), `.paywallPurchaseStarted`
-/ `Completed` / `Pending` / `Cancelled` / `Failed` (`productID`, `source`, `transactionID`, `error`),
-`.paywallRestoreRequested` / `Completed` / `Failed` (`error`), and `.paywallPurchaseIntent` (`productID`).
-
-For display, `.paywallSheet`, `.paywallLifecycle()` and `PaywallHostingController` also put the resolved
-entitlement in the environment as `\.paywallEntitlement`: `nil` until the first resolution answers (so a view can
-show a placeholder instead of the free state), then `.free`, `.subscribed` or `.lifetime`, kept current from
-`Paywall.entitlement`. It is a convenience like `\.paywallGate`; access decisions stay with the gates and
-`withPaywall`.
-
-```swift
-@Environment(\.paywallEntitlement) private var entitlement   // Entitlement?, nil while resolving
-```
-
-What crosses a UIKit boundary, measured by `UIKitBoundaryTests` in the test host on the iOS 18.0 and 17.5
-Simulators, with identical rows (every layer kind alone, every ordered pair, twelve triples; the suite runs in the
-host because a modal presentation never completes in the package's unhosted test process; iOS 15 runtimes no
-longer run on current macOS): `pendingFailure`, `.onPaywallFailure`, `events` and
-`purchaseIntents` reach through anything. Environment values set above the stack (`\.paywallGate` and
-`\.paywallEntitlement`, which travel together in every row) reach through SwiftUI-managed layers, and SwiftUI also
-carries them into a hosting controller that stays in the view-controller containment hierarchy under its tree: a
-representable's, one pushed by a navigation controller, one in a table cell. They are lost as soon as a UIKit modal
-presentation is anywhere in the stack, and a hosting controller that UIKit code creates outside the tree (a
-UIKit-first screen) gets nothing. `PaywallFailureKey` climbs out of every UIKit layer, the modal included, and
-never out of a `.sheet`. The suite records those rows rather than promising them: the design did not count on
-them. The contract is `PaywallHostingController`: the gate session it is given, `Paywall.shared` as an environment
-object (with the `PaywallServiceProvider` that configured it, when the app installed one) and the resolved
-entitlement are in its environment whatever the layer. A reservation held behind any UIKit layer is released when
-the layer goes, through the hosting controller's presence signal, without relying on `onDisappear`.
-
-## Store
-
-`products()`, `purchase(_:)`, `restorePurchases()`, `refresh()`, `subscriptionPhase()` and
-`isEligibleForIntroOffer()` go through the engine. Pack credits are written to the ledger before
-`finish()`. Refunds become revocation events: a refunded pack arrives on `Transaction.updates` and is also found
-by every resolution in `Transaction.all`, which lists finished consumables only when the app's `Info.plist` sets
-`SKIncludeConsumableInAppPurchaseHistory` (set it; the test host does). Prices and offers come with the storefront
-(see Catalog and storefront); offline, `products()` returns the last storefront marked not purchasable. The package
-never calls `AppStore.sync()` or refreshes the receipt on its own; only `restorePurchases()` does.
-
-The outcome chains like a gate's. A store error is thrown by `purchase` itself, so the `try` stays and no handler
-runs. A purchase does not re-run the `withPaywall` call it was bought for: open view gates re-evaluate on their own,
-a call site runs the action again.
-
-```swift
+// Buy from the paywall screen; the entitlement and the wallet update on their own.
 try await Paywall.shared.purchase(product, source: failure.source)
-    .onPurchaseCompleted { transactionID in dismiss() }   // ledger and entitlement already updated
-    .onPurchasePending { dismiss() }                      // Ask to Buy: the transaction arrives on `Transaction.updates`
+    .onPurchaseCompleted { _ in dismiss() }
+    .onPurchasePending { dismiss() }
     .onPurchaseCancelled { }
 ```
 
-`StoreKit2Client` is `@concurrent`: StoreKit's work and the receipt parse run off the caller's actor, so the
-main actor's only disk I/O stays the draw path. `Subscription.willAutoRenew` is `true` from a transaction
-(StoreKit does not put the renewal preference on it); the account screen reads the renewal state through
-`subscriptionPhase()`.
+Two things the app must do: set `SKIncludeConsumableInAppPurchaseHistory` in `Info.plist` (without it a refunded
+token pack disappears from StoreKit's history instead of being revoked), and keep a `.storekit` configuration and the
+App Store Connect products in step with the catalog; `ProductCatalog.mismatches(withStoreKitConfiguration:)` reports
+drift in a test. Builds that ship before the freemium launch set `configuration.passthrough = true`: every gate
+passes and nothing starts.
 
-### Promoted in-app purchases
+## Public API
 
-`PurchaseIntent.intents` (iOS 16.4+) is listened to from `start()`. An intent becomes a `.purchaseIntent`
-event, `Paywall.pendingPurchaseIntent` and a call to `.onPurchaseIntent`; the engine buys nothing on its own.
-Starting a purchase of that product, or `consumePendingPurchaseIntent()`, clears it. StoreKit Testing cannot
-simulate an intent, so the review test `promoted_purchase_intent_opens_paywall` drives it through `FakeStore`.
+Each row names the entry point, what it does, and what must come before or after it. Types without a module note
+come with `ZTronPaywallKit`; the value types they take and return are declared in `PaywallCore`.
 
-### Family Sharing
+### Configuring
 
-`configuration.familySharing` is `.sharedEntitlements` (a family member's subscription or lifetime purchase
-counts as paying here; the entitlement says `isFamilyShared`) or `.purchaserOnly` (a family-shared transaction
-resolves as if absent). Tokens never cross members whatever the value: consumables cannot be shared and the
-account key is per Apple Account. The policy is applied at every resolution and to the cached snapshot before
-the first one, so a build that changes it takes effect at its first launch, and a removal from the family is a
-revocation like a refund.
+| API | What it does | Before / after |
+|---|---|---|
+| `ProductCatalog`, `TokenPack` | Declares the products: a subscription group with its weekly, monthly and yearly tiers, a lifetime purchase, token packs. The authority on what each product is. | First. `Paywall.Configuration` takes it; `mismatches(withStoreKitConfiguration:)` checks it against a `.storekit` file in a test. |
+| `Paywall.Configuration` | Everything the paywall runs on: the catalog, `grandfathering`, `familySharing`, `welcomeTokens`, `tolerance`, `leasePolicy`, `audit` sinks, `sync`, `promotionalOfferSigner`, `connectivity`, `clock`, `store`, `storageDirectory`, `passthrough`, `onStart`. | Built from a catalog, then handed to `PaywallServiceProvider` or `Paywall.configure`. |
+| `GrandfatheringPolicy` | Which installs keep what they paid for: the last paid build and the paid window, with sentinels for the odd cases. | Set on the configuration before configuring; applied at every resolution. |
+| `FamilySharingPolicy` | `.sharedEntitlements` (a family member's purchase counts) or `.purchaserOnly`. Tokens never cross members. | Set on the configuration; a change takes effect at the next launch. |
+| `PaywallServiceProvider` | The one object the app root holds. Runs the production implementation or a fake (`.production(_:)`, `.fake(_:)`), switches at runtime (`useProduction`, `useFake`, `use`), reports `isFake`. | Create as a `@StateObject` at the root; it configures `Paywall.shared` at once. Install with `.paywallProvider(_:)`. |
+| `.paywallProvider(_:)` | View modifier: puts the provider and the facade in the environment, keeps `\.paywallEntitlement` current, re-resolves when the scene becomes active. | On the root view, after `.paywallSheet`. Replaces `.paywallLifecycle()`. |
+| `Paywall.configure(_:)`, `waitUntilStarted()` | Manual setup without a provider. Validates the catalog and opens the ledger synchronously, so the wallet is known before the first frame. | Once at launch, before any gate. `waitUntilStarted` before reading store-derived state in tests. |
+| `Paywall.Configuration.grandfatherOverride` | Debug builds only: pretend the install bought a given version on a given date, to test the grandfather branch on a device. | Compiled out of release. |
 
-### Receipt verification (iOS 15 path)
+### Reading state
 
-`ReceiptClient` reads the App Store receipt, and `AppleReceiptVerifier` checks it before anything is parsed:
+| API | What it does | Before / after |
+|---|---|---|
+| `Paywall.shared` | The facade, an `ObservableObject`: `entitlement`, `wallet`, `tier`, `storefront`, `pendingFailure`, `pendingPurchaseIntent`, `configurationError`, `isPassthrough`. | After configuring. Read from views as `@EnvironmentObject var paywall: Paywall`. |
+| `Entitlement`, `Subscription`, `LifetimeSource` | What StoreKit says the account has: `.unknown`, `.free`, `.subscribed(…)`, `.lifetime(…)` with a `LifetimeSource` of `.purchase`, `.familyShared` or `.grandfathered`. | Published by the facade; never set by the app. |
+| `AccessTier`, `SubscriptionTier` | One comparable scale, `.free < .freeTrial < .tokens < .weekly < .monthly < .yearly < .lifetime < .grandfathered`, for "what ranks above the current one". | Derived from the entitlement and the wallet. |
+| `Wallet` | Tokens as views see them: `balance`, `reserved`, `available`. | Published by the facade. |
+| `Paywall.canPass(_:id:)`, `evaluate(…)` | Answers whether a gate would open now, without drawing. | For disabled buttons and badges; a real draw still goes through `withPaywall`. |
+| `Paywall.events`, `eventStream` | Every decision, once: a Combine publisher and an `AsyncStream` of `PaywallEvent`. | Subscribe after configuring. |
+| `PaywallEvent`, `GateDecision`, `PurchaseStage`, `RestoreStage` | The event vocabulary: gate decisions, purchase and restore stages, entitlement changes, sync, storefront changes, promotional offer signatures. | What `events`, the audit log and the notifications carry. |
+| `Paywall.subscriptionPhase()`, `isEligibleForIntroOffer()` | The renewal state (active, grace period, billing retry, expired) and introductory offer eligibility, from StoreKit. | For the account screen; `Subscription.willAutoRenew` alone is not the renewal preference. |
 
-- PKCS#7 `SignedData` with Apple's layout (no signed attributes, RSA PKCS#1 v1.5 over the payload, SHA-256; SHA-1
-  on receipts signed before 2023), signed attributes accepted with the `messageDigest` checked;
-- the signer certificate found in the container chains to the **Apple Root CA** (embedded, SHA-256
-  `b0b1730e…f024`) as the only anchor, evaluated **at the receipt's creation date** (field 12), because Apple
-  rotates the signing certificate and a 2015 receipt stays valid after its certificate expired;
-- the signer carries Apple's receipt-signing marker extension `1.2.840.113635.100.6.11.1`, so a certificate
-  Apple issued for anything else cannot sign one;
-- field 2 names this app's bundle id.
+### Gating
 
-Not checked: the device GUID hash (field 5), which binds a receipt to one device. It needs
-`identifierForVendor` and only matters against a user copying their own receipt between their own devices.
+| API | What it does | Before / after |
+|---|---|---|
+| `GateLevel` | What a gate asks: `.free`, `.paid`, `.tokens(n)`. | The first argument of every gate. |
+| `withPaywall(_:id:_:)` (sync and async) | Runs a body behind a gate. Draws the tokens durably before the body, refunds them if the body throws, publishes a `PaywallFailure` when closed. Returns `PaywallOutcome`, whose `.blocked` is a value; `.get()` for the throwing style. | After configuring. Pair with `.paywallSheet` so a denial shows the screen. |
+| `.paywallGated(_:policy:id:)`, `.paywallGated(_:denied:)` | Gates a view. `policy: .reserve` (default) holds the tokens and spends only when something inside commits; `.deductNow` draws on appear. A refund or expiry while on screen flips the view live. | Under `.paywallProvider`. Pass a stable `id` when the lease must survive a view rebuild. |
+| `\.paywallGate`, `GateSession.withPaywall` | Inside gated content: the gate the view lives behind, so a button commits the reservation it holds. | Only inside `.paywallGated` content. |
+| `TokenPolicy`, `LeasePolicy` | How a view gate spends, and whether a lease is fixed from the draw or refreshed on re-entry. | `LeasePolicy` is a configuration value; `TokenPolicy` a per-view argument. |
+| `PaywallOutcome`, `PaywallFailure`, `PaywallSource` | What a gate returns, why it closed (`reason`, the level, the wallet at the time) and where it lives (`id`, file, function, line). | `PaywallFailure.source` goes back into `purchase(_:source:)` so the audit links the buy to the gate. |
+| `Paywall.grant(tokens:reason:id:)` | Credits tokens outside a purchase (a promotion, a support gesture). Idempotent by `id`. | After configuring. Lands in the ledger and syncs like a purchase. |
 
-The Mac App Store receipts installed on the machine running the tests are verified as a bonus: purchase
-receipts (`Production`) verify and parse; Apple's `ProductionStub` receipts for its bundled apps carry no
-original version and fail closed, as they should.
+### Showing the paywall
 
-## Crash safety
+| API | What it does | Before / after |
+|---|---|---|
+| `.paywallSheet { failure in … }` | Presents your screen whenever a gate under it closes, with the `PaywallFailure`. The nearest sheet takes the denial. | On the root, and on any presented sheet that contains gates. |
+| `.paywallScope(_:)`, `.onPaywallFailure(…)`, `Paywall.failures(scope:id:)` | Route denials: a scope names which sheet handles them; the handlers and the publisher deliver them to code. | Alternatives to the default sheet. |
+| `.onPurchaseIntent(perform:)`, `Paywall.purchaseIntents`, `consumePendingPurchaseIntent()` | A promoted in-app purchase tapped in the App Store arrives as a product id; show its screen. | Starting the purchase clears the intent. |
+| `PaywallDisclosure(product:whatYouGet:termsURL:privacyURL:)` | The pre-purchase disclosure guideline 3.1.2(c) requires, as one value: price, period, trial, renewal, cancellation, links; `isComplete` says it is. | Build it from the `PaywallProduct` the screen offers, before the Buy button renders. |
+| `.paywallLifecycle()`, `consumePendingFailure()`, `Paywall.bridgeToNotificationCenter(_:)`, `Notification.Name.paywall…` | For apps not using the provider or SwiftUI: lifecycle hooks, one-shot reads and `NotificationCenter` posts (`paywallDenied`, `paywallEntitlementChanged`, `paywallPurchaseCompleted`, …) with `PaywallNotificationKey` payloads. | Optional. |
+| `PaywallHostingController` | The UIKit bridge: hosts SwiftUI content with the facade and provider re-injected; `paywallFailures(…)` and `presentPaywall(for:screen:)` for UIKit-driven presentation. | For UIKit containers and navigation stacks. |
 
-The proof obligation: delivered(g) ⇒ durableDebit(g). The draw runs in this order:
+### Store
 
-1. `decided`
-2. `debitAppended`: `write(2)` of a CRC-framed, canonical-JSON ledger event
-3. `debitSynced`: `F_FULLFSYNC`, falling back to `fsync`
-4. `valueDelivered`
-5. `auditWritten`
+| API | What it does | Before / after |
+|---|---|---|
+| `Paywall.products()`, `refreshStorefront()`, `PaywallStorefront`, `PaywallProduct` | The catalog as the App Store sells it: prices, periods, offers and eligibility per product. Offline, the last storefront, marked not purchasable. | After configuring; refreshed hourly, on restore, and on demand. Feeds the screen. |
+| `Paywall.purchase(_:source:)` → `PurchaseOutcome` | Buys a product. Pack credits land in the ledger before the transaction is finished; the entitlement updates itself. Handlers chain: `onPurchaseCompleted`, `onPurchasePending` (Ask to Buy), `onPurchaseCancelled`. Store errors are thrown. | From the screen, with the failure's `source`. A purchase does not re-run the gate it was bought for. |
+| `Paywall.purchase(_:promotionalOffer:source:)`, `PaywallProduct.Offer` | Buys a subscription with a promotional offer: asks the configured signer for this install's signature, then buys with it. | Needs `configuration.promotionalOfferSigner` and a deployed signer. The offer comes from `PaywallProduct.offers` with kind `.promotional`; introductory offers need nothing. |
+| `RemotePromotionalOfferSigner(endpoint:transport:timeout:)`, `HTTPTransport`, `URLSessionTransport` | The client of the signing worker: posts bundle, product, offer and app transaction id, returns the signed offer. | Deploy `Workers/PromotionalOfferSigner` first; set the client on the configuration. |
+| `Paywall.restorePurchases()` | The Restore button: syncs with the App Store and re-resolves. The only call that triggers `AppStore.sync()`. | From the screen's Restore button, never automatically. |
+| `Paywall.refresh()`, `didBecomeActive()`, `syncNow()` | Re-resolve now; what the provider does on foreground; push and pull the ledger now. | Usually not needed with the provider installed. |
+| `StoreKit2Client`, `NetworkPathConnectivity`, `ReceiptClient`, `AppleReceiptVerifier` | The production adapters behind the defaults: StoreKit 2, `NWPathMonitor`, and the on-device receipt path used on iOS 15. | Replace through `configuration.store` and `.connectivity` only to substitute them. |
 
-`CrashSafetyTests` terminates the engine at every `DrawStep` (`CaseIterable`, so a new step won't compile
-until it's covered), relaunches on the same directory, and checks that tokens never leak and value is never
-delivered without a debit. Torn tails are truncated at open. A short `write(2)` is rewound to the frame
-boundary, and if even that fails the journal stops writing until the relaunch truncates the torn frame, so a
-half-written frame can never hide the records after it. Compaction writes a side file and renames it over the
-log. A seeded property test drives the lease state machine.
+### Audit
 
-`DrawPerformanceTests` bounds the draw at 25 ms (median and p95 over 60 draws with `F_FULLFSYNC`), on macOS and
-on the iOS Simulator, on an empty ledger and on one of 20,000 events; the design states the bound for a device,
-where it has not been measured yet.
+| API | What it does | Before / after |
+|---|---|---|
+| `PaywallAuditSink`, `AuditRecord`, `ClosureSink`, `JournalSink`, `OSLogSink` | Where the audit goes: your closure (analytics), a rotating JSON-lines file in the paywall directory, the unified log (subsystem `ztron.paywall`). The file and the log are on by default. | Add sinks to `configuration.audit`; `includesDefaultAudit = false` drops the defaults. |
+| `Paywall.verifyAuditChain()`, `exportAudit()` | Checks the hash chains of the audit log and the ledger, and writes an export for support or a dispute. | Any time after configuring. |
 
-## Retention
+### Cross-device sync (`ZTronPaywallCloudSync`)
 
-What a long-lived install must not pay for its history, and what the package forgets:
+| API | What it does | Before / after |
+|---|---|---|
+| `PaywallCloudSync(containerIdentifier:keychain:)` | The recommended carrier: ledger events in the CloudKit private database, merged as a set, plus a Keychain wallet snapshot so a reinstall shows the balance before the first sync. | Set as `configuration.sync` before configuring. Needs the iCloud capability with CloudKit and a container. |
+| `KeychainWalletSnapshotStore(service:account:synchronizable:)` | The snapshot store on its own, if the Keychain item needs another name. | Passed to `PaywallCloudSync`. |
+| `LedgerSync`, `CloudDatabase`, `CloudKitDatabase`, `InMemoryCloudDatabase` | The seams: write your own carrier, or run the real merge logic against an in-memory cloud in tests. | Optional. |
 
-- **The ledger's derivations are maintained, not replayed.** `Ledger` keeps the balance per account partition and
-  the lease table per partition up to date as events are appended, in whatever order a sync delivers them (a refund
-  or an extension may arrive before its debit), so a draw, a hold and a merge cost the same on a ten-year history as
-  on a fresh install. `LedgerIncrementalTests` checks every append of random histories against a full replay.
-- **The journal is checkpointed, and compaction drops what the checkpoint covers.** A compacted `ledger.log` starts
-  with a `.checkpoint` record: the ledger's derived state, which is everything a later event may still refer to. The
-  balances with their cross-account parts, the lease table of every account partition, the per-device heads the next
-  events link to, the credits a revocation may reverse, every debit a refund may give back or a lease may fall back
-  to (amount, account, date, lease, gate), the refunds and revocations that arrived before their counterpart, every
-  event id (so a replay or a re-delivery of a forgotten event stays a no-op and the sync union merge and the outbox
-  stay exact), and what the chain check needs to go on: per device the hashes no event links to yet, whether the
-  first event was seen, the events whose predecessor the sync has not delivered, and a fork. The engine starts from
-  the checkpoint and replays only the events after it. `LedgerIncrementalTests` proves that a replay from a
-  checkpoint taken anywhere in a random, shuffled, two-device history observes exactly what the full replay does,
-  the chain verdicts included: an event whose predecessor is missing is a broken link until it arrives, a fork stays
-  one for good. The checkpoint grows with the ids and debits of the history, at a fraction of an event's size;
-  nothing else of the history survives it.
-- **The retention rule.** `start()` writes a checkpoint when more events than `compactionThreshold` (4096) followed
-  the last one at open, and only after this launch's audit repair ran over those very debits and the audit trail
-  flushed, so every debit a checkpoint covers has its audit record before the journal forgets it. Only what an
-  earlier process wrote is covered: a debit drawn before `start()` got there stays in the log for the next launch's
-  repair, and nothing is written after `shutdown()`. The rewrite goes to a side file that is synced and renamed over
-  the log, as compaction always did; an interrupted one leaves the old log intact and the side file is deleted at the
-  next open. What survives the rewrite: the checkpoint; the outbox, the events the carrier has not acknowledged, kept
-  behind the checkpoint that already counts them (replays to the ledger, dropped by the next compaction once
-  acknowledged); and every event appended since. Without a carrier nothing will ever acknowledge the outbox, so none
-  is kept, and a carrier configured by a later build receives the events written since the last checkpoint only. The
-  marker compaction at open stays: `ledger.log` is rewritten when it holds more `.uploaded` markers than the
-  threshold, and with a checkpoint in front the acknowledged events it counts go too. A corrupt checkpoint, or one
-  from a newer build's format, drops the log like any undecodable first frame; the Keychain snapshot and the carrier
-  then restore the ledger as after a reinstall. On the 20,000-event history of `DrawPerformanceTests` (17,142 debits
-  on 50 gates, 2,857 extensions) the iPhone 17 simulator opens the engine in 144 ms from the checkpoint against 500 ms
-  for the full replay, and `ledger.log` shrinks from 6.1 MB to 2.2 MB; the test prints both pairs.
-- **The audit log forgets by rotation, and the repair knows it.** `audit.jsonl` rotates at 5 MB and keeps 10 files.
-  Dropping a file writes `audit.anchor`, the hash of the last record dropped: `verifyAuditChain` checks the retained
-  chain from there, and the export carries the anchor. The launch repair (`auditRepaired`) only considers debits
-  newer than the oldest retained record; older ones have simply been rotated out. A refunded debit counts as known
-  to the audit. The chain's last hash is read from the tail of the newest file, not by decoding every file.
+### Simulator (`ZTronPaywallSimulator`, debug builds only)
 
-## Reinstall and the Keychain snapshot
+| API | What it does | Before / after |
+|---|---|---|
+| `PaywallServiceProvider.Service.simulated(_:catalog:)`, `.fromLaunchArguments(production:)`, `provider.useSimulated(…)` | Run the production engine on a simulated store, picked in code, from a debug menu, or by `-paywall.*` launch arguments in UI tests. | Instead of `.production`. Compiles to nothing in release. |
+| `PaywallPreset`, `PaywallSimulation` | Named states (`free`, `trial`, `weekly`, `monthly`, `yearly`, `lifetime`, `grandfathered`, `tokens5`, `broke`, `offline`, `storeDown`) and every switch behind them. | Applied through the provider or `PaywallSimulator.shared.apply`. |
+| `PaywallSimulator.shared` | Drives the fake live: `refund`, `renew`, `expire`, `enterGracePeriod`, `enterBillingRetry`, `purchaseTokenPack`, `grantTokens`, `advance(by:)`, `reset`, `settle`. | While a simulated service is in use. |
+| `.paywallSimulation(_:catalog:)`, `PaywallLaunchArguments` | Previews on a simulated paywall; the parsed launch arguments with their problems. | Previews and UI tests. |
 
-After a reinstall the Keychain snapshot stands in for the history this install has not seen. Once the carrier
-has answered with events for the account, the snapshot steps aside: if its last event is among them the ledger
-is complete; if not, that event was never uploaded and died with the old install, and keeping the snapshot on
-top of the remote history would count every uploaded credit twice. A carrier that answers with nothing (iCloud
-off, empty container) leaves the snapshot standing.
+### Fakes (`ZTronPaywallTesting`)
 
-The snapshot is adopted at `start()` only when the ledger holds no events for its account: a reinstall, or a
-new device. A ledger with history never gets a snapshot added on top, because it cannot tell which part of that
-history the snapshot already counts. The item is `synchronizable`, so another device's snapshot can arrive
-through iCloud Keychain before that device's debits were pulled; adopted over the local history, it would count
-every local credit twice (a 10-pack read as 19 at an offline relaunch). This device's own snapshot written ahead
-of a journal that lost its tail would do the same. Neither is adopted.
+| API | What it does | Before / after |
+|---|---|---|
+| `FakeStore`, `FakeClock`, `FakeConnectivity`, `FakePromotionalOfferSigner` | Scriptable stand-ins for the store (entitlements, purchase outcomes, refunds), the clock, the network path and the signer. | Plug into `Paywall.Configuration` (`store`, `clock`, `connectivity`, `promotionalOfferSigner`) in tests. |
+| `InMemoryAuditSink`, `InMemoryCloud`, `InMemoryLedgerSync`, `EntitlementTimeline` | Collect audit records; several carriers on one in-memory cloud converge like devices on one account; a scripted entitlement over time. | `audit` and `sync` on the configuration. |
 
-## Simulator (debug builds)
+### Engine (`ZTronPaywallCore`, without UI or StoreKit)
 
-```swift
-#Preview { HeatmapView().paywallSimulation(PaywallSimulation(.tokens5)) }
+| API | What it does | Before / after |
+|---|---|---|
+| `GateEngine`, `GateEngine.Settings` | The engine the facade drives: `begin`/`complete`/`abort` or `run` for a gate, `refresh`, `purchase`, `restore`, `handle(_:)` for a transaction, `merge(_:)` for synced events. | For apps that bring their own `StoreClient`. The facade is the supported path on iOS. |
+| `StoreClient`, `StoreTransaction`, `AppTransactionSnapshot`, `PaywallClock`, `PaywallConnectivity`, `PromotionalOfferSigner` | The seams an engine runs on. `PromotionalOfferSigner` is also the hook for a client that attaches App Attest assertions. | Implement to substitute; the kit provides the production ones. |
+| `Ledger`, `LedgerEvent`, `Journal`, `EntitlementResolver`, `CreditReconciler`, `LeaseTable`, `ReservationTable`, `SHA256Digest`, `CRC32`, … | Public so the package's own modules and tests can reach them. Not an integration surface; they can change between minor versions. | Avoid. |
 
-// UI tests: -paywall.preset broke -paywall.tokens 3 -paywall.network off -paywall.store down
-Paywall.shared.configure(.simulated(PaywallLaunchArguments(), catalog: catalog))
-// or, through the root provider (see Setup): production unless a `-paywall.*` argument is present
-@StateObject private var paywall = PaywallServiceProvider(.fromLaunchArguments(production: configuration))
+### Companion: the signing worker
 
-PaywallSimulator.shared.apply(.lifetime)
-PaywallSimulator.shared.refund(.lastTokenPack)
-PaywallSimulator.shared.advance(by: 301)
-```
+`Workers/PromotionalOfferSigner` is a Cloudflare Worker (TypeScript, wrangler). `POST /v1/promotional-offers/sign`
+takes `{bundleId, productId, offerId, transactionId?}` and answers `{compactJWS, …}`; `GET /v1/keys` serves the
+public key as a JWKS; `GET /v1/health` answers `{"ok": true}`. Its secrets are `APPLE_IAP_PRIVATE_KEY`,
+`APPLE_IAP_KEY_ID`, `APPLE_IAP_ISSUER_ID`, `APPLE_BUNDLE_IDS` and the optional `ALLOWED_OFFERS`, set with
+`wrangler secret put`. Deploy it, then point `RemotePromotionalOfferSigner` at its URL. Details in
+[its README](Workers/PromotionalOfferSigner/README.md).
 
-## App Review
+## Risks assessment
 
-The design maps each App Review rejection cause to a named test. This package holds the package half:
-`AppReviewTests`, `EdgeCaseTests` and `AuditTableTests` in `PaywallCoreTests`, the disclosure and receipt
-tests in `PaywallKitTests`, and `StoreKitIntegrationTests` in the test host (refunds, Ask to Buy, renewals at
-accelerated time, crossgrades, cancellation, restore, against the real `StoreKit2Client`).
+| Risk | What the package does | What stays with the app |
+|---|---|---|
+| **App Review 3.1.1: unlocking without an in-app purchase.** | StoreKit 2 is the only source of entitlements; no code path grants one. Debug overrides and the simulator compile to nothing in release, and `Scripts/check-release-symbols.sh` fails the build if they leak. | Keep the archive check in your pipeline; never ship a build with `passthrough` on past the freemium launch. |
+| **App Review 3.1.2: subscription disclosures, grandfathering, family sharing.** | `PaywallDisclosure` gathers what 3.1.2(c) requires; `GrandfatheringPolicy` and `FamilySharingPolicy` are applied at every resolution; tests map rejection causes to behaviour. | The screen: showing the disclosure, a Restore button, terms and privacy links, hiding Buy for the current tier. |
+| **Value leaks or double spends around crashes.** | The debit is durable before the gated code runs; a crash at any step is recovered at the next launch; a throwing body refunds its draw. | Gate the paid value itself (`.reserve` content is a shell until something inside commits). |
+| **The signing endpoint is public.** Anyone can obtain an offer signature for an allowed app. | The App Store applies its own eligibility rules on top; the worker signs only configured bundle ids and, with `ALLOWED_OFFERS`, only listed offers; Cloudflare rate limiting bounds volume. | Who is shown an offer is the app's decision. App Attest in front of the worker if that decision must hold against a tampered client. |
+| **The signer is down or slow.** | The purchase with an offer fails before the payment sheet, with the signer's error, after the usual `.purchase(stage: .failed)` event; plain purchases are unaffected; the request has a 15-second timeout. | Offer the regular price when the offer purchase fails. |
+| **The In-App Purchase key is compromised or rotated.** | The key exists only as a Worker secret, imported non-extractable; nothing in the app changes with the key. | Revoke in App Store Connect, `wrangler secret put` the new key and id. |
+| **Device clock manipulation.** | Entitlements come from StoreKit's signed transactions, not from the clock. Token leases outlive their draw by `tolerance` (300 s by default), bounding what a moved clock buys. | Choose `tolerance` and `leasePolicy` for your gates. |
+| **Offline.** | Entitlements resolve from StoreKit's on-device cache; `products()` returns the last storefront, not purchasable; token gates keep working on the local ledger; synced events queue and drain when a path returns. | Nothing; show the storefront's `priceAsOf` when prices are stale. |
+| **Reinstall and account changes.** | With `ZTronPaywallCloudSync`, the balance survives a delete-and-reinstall through the Keychain snapshot and the cloud; without a carrier the package has no memory beyond StoreKit, so a reinstall grants welcome tokens again. | Decide whether tokens are worth a CloudKit container. |
+| **Refunds and revocations.** | A refunded pack is revoked and its credit reversed; a refunded subscription or a family removal ends the entitlement at the next resolution; the audit links each reversal to what it reverses. | `SKIncludeConsumableInAppPurchaseHistory` in `Info.plist`, or refunded packs vanish from history instead. |
+| **StoreKit Testing is not the App Store.** | The test host runs the real StoreKit client against a `.storekit` configuration, including a promotional offer purchase. | Verify in the sandbox before release; eligibility and renewal timing differ. |
+| **Platform scope.** | iOS 15+. macOS is a test host only; Linux builds the engine and fakes only. | Do not ship the package on macOS. |
 
-`ProductCatalog.mismatches(withStoreKitConfiguration:)` compares the catalog with a `.storekit` file. It reports
-missing products, wrong types, wrong renewal periods and subscriptions split across groups. The package's own
-file, `Tests/PaywallKitTests/Fixtures/Paywall.storekit`, is the one the simulator and host lanes load, and
-`the_storekit_configuration_matches_the_test_catalog` keeps it in step with the test catalog. The host app runs
-the same check against its own file.
+## Known defects and limitations
 
-`Scripts/check-release-symbols.sh` builds release and fails if a shipping module contains simulator, preset,
-launch-argument, fake, override or simulation-hook symbols, or if `PaywallSimulator` is not empty.
+As of 2026-11-14 there is no known correctness defect in a shipping code path. The open items:
 
-## Development
+- **Win-back offers** are modelled in the storefront for display, but no `purchase` call redeems one: the iOS 18
+  purchase option is not passed yet.
+- **The 25 ms draw bound** is measured on macOS and on the iOS Simulator, not on a device.
+- **iOS 15 and 16**: `NWPathMonitor` can only report on a dispatch queue there, which the package does not use, so the
+  sync outbox drains on launch, foreground, purchase and a 30-second timer rather than the moment a path returns.
+- **`Subscription.willAutoRenew`** is `true` from a transaction, because StoreKit does not put the renewal preference on
+  it; read `subscriptionPhase()` for the real state.
+- **Live-only coverage**: the CloudKit forwarders and container initialisers, and the network path of
+  `URLSessionTransport`, run only in the local live lanes, not in CI.
+- **StoreKit Testing and promotional offers**: the local store server accepts an offer only when the `.storekit` file
+  carries a `subscriptionOffersKeyPair` at its top level with a base64 PKCS#8 P-256 key; without it the purchase fails
+  with `StoreKitError.unknown`. The package's fixture ships such a key.
+- **iOS 27 simulator runtimes** (Xcode 27, November 2026): the test host's StoreKit lane can stall on an App Store
+  sign-in sheet; it runs clean on an iOS 26 runtime.
 
-Four lanes, all run by `.github/workflows/test.yml`, and a fifth that only runs locally (below):
+## Secrets
 
-```bash
-swift build --build-tests -Xswiftc -warnings-as-errors && swift test --enable-code-coverage
-```
+Nothing identifying the publisher or its apps is in this repository, ever: no In-App Purchase key, key id or issuer id,
+no App Store receipt, no team id, no production bundle id or app name. Where tests or tools need a secret, it is
+simulated:
 
-```bash
-xcodebuild test -scheme ztron-paywall-kit-Package -destination 'platform=iOS Simulator,name=iPhone 16 Pro' -skipPackagePluginValidation -enableCodeCoverage YES -resultBundlePath /tmp/package.xcresult
-```
+- The `.storekit` fixture's `subscriptionOffersKeyPair` is a throwaway P-256 key generated for StoreKit Testing.
+- The worker's tests generate a fresh key per test, and `.dev.vars` for local runs (gitignored) is written from the
+  fixture's key by `Scripts/worker-dev-vars.sh`.
+- Receipt fixtures are signed by a throwaway certificate chain from `Scripts/make-receipt-fixtures.sh`; the lane that
+  checks a real receipt reads it from a path outside the repository and is skipped without one.
+- `*.p8` is gitignored at the root and in the worker.
 
-```bash
-xcodebuild test -project TestHost/TestHost.xcodeproj -scheme TestHost -destination 'platform=iOS Simulator,name=iPhone 16 Pro' -skipPackagePluginValidation -enableCodeCoverage YES -resultBundlePath /tmp/host.xcresult CODE_SIGNING_ALLOWED=NO
-```
+The real values exist in two places only: App Store Connect, and the Cloudflare Worker's secrets. CI runs entirely on
+the simulated ones.
 
-```bash
-docker run --rm -v "$PWD":/pkg -w /pkg swift:6.3-noble bash -c 'swift test --enable-code-coverage && Scripts/coverage-gate.sh --targets "PaywallCore PaywallTesting"'
-```
+## More
 
-Then the gate, which merges `llvm-cov` from `swift test` with the `xccov` reports of the two simulator lanes:
-
-```bash
-xcrun xccov view --report --json /tmp/package.xcresult > /tmp/package-xccov.json && xcrun xccov view --report --json /tmp/host.xcresult > /tmp/host-xccov.json && Scripts/coverage-gate.sh --baseline coverage-baseline.json --xccov /tmp/package-xccov.json --xccov /tmp/host-xccov.json
-```
-
-```bash
-swift test --sanitize=thread
-```
-
-### Live CloudKit lane (local)
-
-`LiveCloudKitTests` runs the production `CloudKitDatabase` and `PaywallCloudSync` against the real container
-`iCloud.com.ztron.paywall.testhost` from the test host: zone setup and the save and change-fetch round trips
-through the `CKDatabase` forwarders; two devices (two engines on their own directories) on one iCloud account
-converging on one ledger after interleaved draws; delete-and-reinstall keeping the balance through the Keychain
-snapshot before the first sync and through the container after it (the pack is bought through the engine's
-purchase path); and an iCloud data reset, where the ledger zone is deleted under a running adapter and comes back
-on the next save and the next fetch while a change token from the old zone restarts the fetch from the beginning.
-Each test deletes the ledger zone first, so the container is empty and the balances it asserts are absolute.
-
-The first live run found a bug the fake had hidden: CloudKit reports a save into a deleted zone per record
-(`zoneNotFound` on each, the call itself succeeding, as `modifyRecords` is not atomic here), not as a thrown error,
-so `CloudKitDatabase.save` never recreated the zone and the outbox stayed unacknowledged until a relaunch. It now
-recreates the zone and retries the batch once in either shape, and `FakeCloudKit` reports a missing zone the way
-the server does.
-
-It needs what CI cannot have: a simulator signed into an iCloud account and a signed host, so the suite is gated on
-`PAYWALL_CLOUDKIT_CONTAINER` (skipped when unset; `TestHost.entitlements` carries the container; the signing team comes
-from `DEVELOPMENT_TEAM` on the command line, and `CODE_SIGNING_ALLOWED=NO` in the default lane needs none). Sign a simulator into iCloud in Settings, then:
-
-```bash
-TEST_RUNNER_PAYWALL_CLOUDKIT_CONTAINER=iCloud.com.ztron.paywall.testhost xcodebuild test -project TestHost/TestHost.xcodeproj -scheme TestHost -destination 'platform=iOS Simulator,name=iPhone 17' -skipPackagePluginValidation -enableCodeCoverage YES -resultBundlePath /tmp/live.xcresult DEVELOPMENT_TEAM=<your team id>
-```
-
-`xcodebuild` hands `TEST_RUNNER_`-prefixed variables to the test process; the `TestHost` scheme also carries the
-variable, switched off, for running the suite from Xcode. The run is the TestHost lane with four more tests, so its
-`xccov` report takes the host lane's place in the gate (or joins it: the merge keeps the best report per file):
-
-```bash
-xcrun xccov view --report --json /tmp/live.xcresult > /tmp/live-xccov.json && Scripts/coverage-gate.sh --baseline coverage-baseline.json --xccov /tmp/package-xccov.json --xccov /tmp/live-xccov.json
-```
-
-With it PaywallCloudSync measures 99.08% of lines: the live lane's `CloudKitDatabase.swift` includes the error paths
-(deleted zone, expired token) because the suite provokes them against the server, so only the one-line fold of a
-whole-call zone error is left to the fake. Do not write that run back with `--write-baseline`: `coverage-baseline.json`
-ratchets what CI measures, the package lane and the unsigned host lane, where PaywallCloudSync is at 97.24%.
-
-The test host (`TestHost/`) is the smallest iOS app that can host `SKTestSession` and a UIKit modal
-presentation: StoreKit refuses purchases, `AppTransaction` and simulated external purchases in a process without
-an app bundle and a window scene, a `present` started there never completes, and `swift test` on macOS is not
-entitled for StoreKit at all. Its tests are `StoreKitIntegrationTests`, `UIKitBoundaryTests` and `LiveCloudKitTests`, in
-one serialized lane because the first two configure `Paywall.shared`. Only the test bundle links the package: a product linked
-by the app too becomes a shared framework whose folded-in `PaywallCore` duplicates the bundle's static copy, and
-two `Paywall.shared`s is how a claim gets lost. It needs iOS 17 for the StoreKitTest Swift API, and its
-`Info.plist` sets `SKIncludeConsumableInAppPurchaseHistory`, without which a refunded token pack vanishes from
-`Transaction.all` instead of showing up revoked (the host test asserts the key is in effect before it refunds).
-
-`Scripts/coverage-gate.sh` enforces two rules, per target, with no exclusions:
-
-- 97% line coverage per target.
-- 100% line and region coverage on the crash-critical files: `Journal`, `LedgerEvent`, `Ledger`,
-  `LeaseTable`, `ReservationTable`, `GateEngine+Draw` and `CreditReconciler`.
-
-With `--baseline`, neither number may drop for any target. `llvm-cov` counts lines per function, closures
-included, so a never-run closure or `??` fallback on an executed line costs a line: the four CloudKit forwarders
-and the two container initialisers in `PaywallCloudSync` are written as single statements for that reason, and
-only the live CloudKit lane executes them (CloudKit traps outside an entitled host).
-
-### Fixtures
-
-`Scripts/make-receipt-fixtures.sh` regenerates `Tests/PaywallKitTests/Fixtures`: a throwaway root → intermediate
-→ leaf chain shaped like Apple's (the leaf carries the receipt-signing marker) and receipts signed in every
-layout the verifier accepts or refuses: SHA-256 without attributes (Apple's), SHA-1, signed attributes, an
-expired signer with and without a creation date, a leaf without the marker, another app's bundle id. Keys are
-discarded; only the root certificate and the receipts are kept. The verifier is pointed at that root in tests
-and at the Apple Root CA in production.
-
-A real **production receipt** of your app runs through the same checks, and then the grandfathering rule, when
-`PAYWALL_PRODUCTION_RECEIPT` names it. `ProductionReceiptTests` verifies it against the embedded Apple Root CA,
-parses it, derives a policy from its own build and purchase date, and checks that the rule, the resolver and a
-configured facade admit it, that the rule refuses it once the paid window ends before the purchase, and that one
-changed payload byte is refused. A receipt names its app, so none is committed and CI skips the suite:
-
-```bash
-PAYWALL_PRODUCTION_RECEIPT=/path/to/receipt swift test --filter ProductionReceiptTests
-```
-
-Such a receipt can only come from an App Store install of the paid app. The ways to get one, in order of
-usefulness:
-
-1. Install the app from the Mac App Store on an Apple silicon Mac: an iOS app keeps its receipt at
-   `~/Library/Containers/<bundle id>/Data/StoreKit/receipt`, root-owned, so copy it with `sudo`. It carries your
-   bundle id and the build that Apple Account first bought, at that account's purchase date: a fresh purchase
-   proves the format and the rule, not an old customer's history.
-2. Any Mac App Store app you own has an Apple-production-signed receipt at
-   `/Applications/<App>.app/Contents/_MASReceipt/receipt`. It proves the signature chain and the parser against
-   Apple's real output (the test suite does this on the machine it runs on) but carries that app's bundle id and
-   marketing version, so it cannot stand in for your app's fixture.
-3. Ship a support export in the freemium build: a hidden action that shares `Bundle.main.appStoreReceiptURL`'s
-   contents and `AppTransaction.shared`'s `jwsRepresentation` through the share sheet. A paid-era user, or your
-   own device that bought the paid version from the App Store, then sends both. A TestFlight build of the same gives a
-   sandbox receipt (`original_application_version` `1.0`), which is the fixture for the sentinel cases.
-4. Xcode's Devices window → Download Container works only for development-signed builds and yields the StoreKit
-   Testing receipt, which `AppleReceiptVerifier` correctly rejects.
-
-Apple does not publish downloadable receipts, and the App Store Server API has no endpoint for them.
-
-### Current coverage
-
-| Target | Lines | Regions | Gate |
-|---|---|---|---|
-| PaywallCloudSync | 97.44% | 86.81% | ok; the CloudKit forwarders and container initialisers run only in the live CloudKit lane |
-| PaywallCore | 99.76% | 98.42% | ok, all 7 crash-critical files at 100/100 |
-| PaywallKit | 98.13% | 83.80% | ok; `StoreKit2Client`, `PaywallHostingController` and the UIKit boundary matrix from the TestHost lane |
-| PaywallSimulator | 98.11% | 91.71% | ok |
-| PaywallTesting | 100.00% | 100.00% | ok |
-
-Measured 2026-11-14 in CI's shape: `swift test` on macOS merged with the xccov reports of the package simulator
-lane and the unsigned TestHost lane, `Scripts/coverage-gate.sh --baseline coverage-baseline.json --xccov … --xccov …`.
-Regions come from `swift test` alone. `coverage-baseline.json` holds these numbers. The live CloudKit lane, which CI
-cannot run, adds the CloudKit forwarders on top (PaywallCloudSync 99.08% when last measured, 2026-11-13); a live run
-is checked against the same baseline. On Linux (`swift:6.3-noble`) the gate runs on PaywallCore and PaywallTesting alone and passes, with the
-crash-critical files at 100/100.
-
-## Not in this package
-
-- **Routing**: the `ZRouteGate` hook belongs in `ztron-routing-kit`.
-- **Adoption**: integrating the package into the host app.
-- **The host half of the App Review table**: the paywall screen (restore button, links, disclosures, retry
-  when products fail, hiding Buy for the current tier), the gated routes, the archive check over the `.ipa`,
-  and `Scripts/presubmit.sh`.
-- **Offer redemption**: `purchase(_:)` passes no `Product.PurchaseOption`. A promotional offer needs the app's
-  server to sign it and a win-back offer the iOS 18 purchase option; the storefront models both for display.
-- **Decided out**: macOS (the Mac is the build host for `swift test`, nothing more), a `UIHostingConfiguration`
-  cell variant for iOS 16+, and a runtime refusal of the simulator in non-debug processes.
-- **The 25 ms draw bound on a device**: measured on macOS and the iOS Simulator; a device lane needs a signed
-  build of the test host.
+- [HANDBOOK.md](HANDBOOK.md): the full account of policies, signals, the store, crash safety, retention, sync, the
+  simulator, App Review mapping, and how to run every test lane.
+- [Workers/PromotionalOfferSigner/README.md](Workers/PromotionalOfferSigner/README.md): the signer's API, secrets,
+  deployment and security model.

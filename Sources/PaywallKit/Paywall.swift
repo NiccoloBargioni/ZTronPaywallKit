@@ -46,6 +46,10 @@ public final class Paywall: ObservableObject {
         /// Injectable for tests and the simulator.
         public var clock: any PaywallClock = SystemClock()
         public var store: any StoreClient = StoreKit2Client()
+        /// Signs promotional offers on your server, where the In-App Purchase key lives: a `RemotePromotionalOfferSigner`
+        /// pointed at the worker in `Workers/PromotionalOfferSigner`. With `nil`, the default, `purchase(_:promotionalOffer:)`
+        /// fails with `PromotionalOfferError.signerNotConfigured`; plain purchases are unaffected.
+        public var promotionalOfferSigner: (any PromotionalOfferSigner)?
         /// Where the journal lives. Default: Application Support/ztron.paywall.
         public var storageDirectory: URL?
         /// Written into every audit record instead of the store environment (`"simulated"`).
@@ -161,7 +165,8 @@ public final class Paywall: ObservableObject {
             build: info?["CFBundleVersion"] as? String ?? "0",
             fullSync: configuration.fullSync,
             welcomeTokens: configuration.welcomeTokens,
-            storefrontRefreshInterval: configuration.storefrontRefreshInterval
+            storefrontRefreshInterval: configuration.storefrontRefreshInterval,
+            bundleID: Bundle.main.bundleIdentifier
         )
         #if DEBUG
             let settings = base.with(grandfatherOverride: configuration.grandfatherOverride)
@@ -172,7 +177,8 @@ public final class Paywall: ObservableObject {
         do {
             engine = try GateEngine(
                 directory: directory, catalog: configuration.catalog, grandfathering: configuration.grandfathering,
-                settings: settings, clock: configuration.clock, store: configuration.store, sync: configuration.sync,
+                settings: settings, clock: configuration.clock, store: configuration.store,
+                promotionalOfferSigner: configuration.promotionalOfferSigner, sync: configuration.sync,
                 connectivity: configuration.connectivity,
                 audit: sinks)
         } catch {
@@ -402,6 +408,19 @@ public final class Paywall: ObservableObject {
         if isPassthrough { return .purchased(transactionID: 0) }
         guard let engine else { throw StoreClientError.notConfigured }
         return try await engine.purchase(productID: product.id, source: source)
+    }
+
+    /// Buys `product` with one of its promotional offers (`product.offers`, kind `.promotional`): asks
+    /// `configuration.promotionalOfferSigner` for this install's signature, then purchases with it. Throws a
+    /// `PromotionalOfferError` before the store is reached when no signer is configured, the offer is not a promotional
+    /// one, or the signer answered for something else; `.purchase(stage: .failed)` is published either way. The outcome
+    /// chains like a plain purchase's.
+    public func purchase(_ product: PaywallProduct, promotionalOffer offer: PaywallProduct.Offer, source: PaywallSource? = nil)
+        async throws -> PurchaseOutcome
+    {
+        if isPassthrough { return .purchased(transactionID: 0) }
+        guard let engine else { throw StoreClientError.notConfigured }
+        return try await engine.purchase(productID: product.id, offer: offer, source: source)
     }
 
     /// `AppStore.sync()`: can prompt for sign-in, so wire it to the Restore button only.

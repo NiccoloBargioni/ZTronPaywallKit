@@ -100,12 +100,16 @@ public struct StoreKit2Client: StoreClient {
     @concurrent
     public func storefrontCountryCode() async -> String? { await Storefront.current?.countryCode }
 
+    /// With `offer`, the purchase carries `Product.PurchaseOption.promotionalOffer(_:compactJWS:)`: the JWS the app's server
+    /// signed, which StoreKit forwards to the App Store. The SDK back-deploys that option to iOS 15.
     @concurrent
-    public func purchase(productID: String) async throws -> StorePurchaseResult {
+    public func purchase(productID: String, offer: SignedPromotionalOffer?) async throws -> StorePurchaseResult {
         guard let product = try await Product.products(for: [productID]).first else {
             throw StoreClientError.productNotFound(productID)
         }
-        switch try await product.purchase() {
+        var options: Set<Product.PurchaseOption> = []
+        if let offer { options.formUnion(Product.PurchaseOption.promotionalOffer(offer.offerID, compactJWS: offer.compactJWS)) }
+        switch try await product.purchase(options: options) {
         case .success(let verification):
             guard case .verified(let transaction) = verification else {
                 throw StoreClientError.unavailable("unverified transaction")

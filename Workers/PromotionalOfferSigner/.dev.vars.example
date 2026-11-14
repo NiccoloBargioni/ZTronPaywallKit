@@ -1,0 +1,13 @@
+# Copy to .dev.vars for `npm run dev`. Use a THROWAWAY key here, never the App Store Connect one:
+#   openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -out dev-key.p8
+# Multi-line values go in double quotes; a key pasted on one line with literal \n sequences also works.
+# For the package's live lanes, generate this file from the StoreKit fixture's test key pair instead:
+#   Scripts/worker-dev-vars.sh > Workers/PromotionalOfferSigner/.dev.vars   (from the repository root)
+APPLE_IAP_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----
+...
+-----END PRIVATE KEY-----"
+APPLE_IAP_KEY_ID=ABCDE12345
+APPLE_IAP_ISSUER_ID=00000000-0000-0000-0000-000000000000
+APPLE_BUNDLE_IDS=com.example.app,com.example.app.beta
+# Optional: only these offers get signed (JSON, product id -> offer ids). Unset signs any offer of an allowed app.
+# ALLOWED_OFFERS={"pro.monthly":["comeback"]}

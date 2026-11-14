@@ -87,7 +87,7 @@ public final class GateEngine {
         /// `F_FULLFSYNC` on the draw path (default) or `fsync` only.
         public var fullSync: Bool
         /// Compaction at open folds the upload markers once the log holds more of them than this; `start()` writes a
-        /// checkpoint and drops the events it covers once more events than this follow the last one (README,
+        /// checkpoint and drops the events it covers once more events than this follow the last one (HANDBOOK.md,
         /// "Retention").
         public var compactionThreshold: Int
         /// The outbox drains at most once per interval.
@@ -98,6 +98,9 @@ public final class GateEngine {
         public var welcomeTokens: Int
         /// Launch and foreground fetch the storefront again when the last fetch is older than this.
         public var storefrontRefreshInterval: TimeInterval
+        /// The app's bundle id, what a promotional offer signature is bound to (`Bundle.main.bundleIdentifier` from the
+        /// facade). `nil` falls back to the app transaction's.
+        public var bundleID: String?
         #if DEBUG
             /// Debug builds only: what the resolver sees as the original purchase. See `GrandfatherOverride`.
             public var grandfatherOverride: GrandfatherOverride?
@@ -120,7 +123,8 @@ public final class GateEngine {
             compactionThreshold: Int = 4096,
             syncCoalescing: TimeInterval = 30,
             welcomeTokens: Int = 0,
-            storefrontRefreshInterval: TimeInterval = 3_600
+            storefrontRefreshInterval: TimeInterval = 3_600,
+            bundleID: String? = nil
         ) {
             self.tolerance = tolerance
             self.leasePolicy = leasePolicy
@@ -133,6 +137,7 @@ public final class GateEngine {
             self.syncCoalescing = syncCoalescing
             self.welcomeTokens = welcomeTokens
             self.storefrontRefreshInterval = storefrontRefreshInterval
+            self.bundleID = bundleID
         }
     }
 
@@ -154,6 +159,8 @@ public final class GateEngine {
     public var settings: Settings
     public let clock: any PaywallClock
     public let store: any StoreClient
+    /// Signs promotional offers for `purchase(productID:offer:source:)`. `nil`: an offer purchase fails before the store.
+    public let promotionalOfferSigner: (any PromotionalOfferSigner)?
     public let sync: (any LedgerSync)?
     public let deviceID: String
     public let sessionID = UUID()
@@ -226,6 +233,7 @@ public final class GateEngine {
         settings: Settings = Settings(),
         clock: any PaywallClock,
         store: any StoreClient,
+        promotionalOfferSigner: (any PromotionalOfferSigner)? = nil,
         sync: (any LedgerSync)? = nil,
         connectivity: (any PaywallConnectivity)? = nil,
         audit sinks: [any PaywallAuditSink] = [],
@@ -238,6 +246,7 @@ public final class GateEngine {
         self.settings = settings
         self.clock = clock
         self.store = store
+        self.promotionalOfferSigner = promotionalOfferSigner
         self.sync = sync
         self.logger = logger
         self.resolver = EntitlementResolver(catalog: catalog, grandfathering: grandfathering, familySharing: settings.familySharing)
@@ -635,7 +644,7 @@ public final class GateEngine {
         }
     }
 
-    /// Retention (README): once more events than `compactionThreshold` followed the last checkpoint at open, the
+    /// Retention (HANDBOOK.md): once more events than `compactionThreshold` followed the last checkpoint at open, the
     /// ledger as it stood at open becomes the new checkpoint and the journal drops the events it covers, except the
     /// outbox. Only what an earlier process wrote is covered, and only after this launch's audit repair saw it in the
     /// journal and the flush put every repaired record in the sinks' hands: a debit written since open stays in the

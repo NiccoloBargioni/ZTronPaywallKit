@@ -1,0 +1,13 @@
+// Cloudflare Worker configuration. Deploy with `npm run deploy` after `wrangler login`.
+//
+// Nothing here identifies your account or app: the key, its id, the issuer id and the bundle ids are Worker
+// secrets (`wrangler secret put <NAME>`, see README.md), never values in this file.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "promotional-offer-signer",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-01",
+  "observability": {
+    "enabled": true
+  }
+}

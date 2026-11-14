@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Coverage gate for ztron-paywall-kit.
+# Coverage gate for ZTronPaywallKit.
 #
 #   97 % line coverage per target (not per package), and 100 % line + 100 % region coverage on the
 #   crash-critical files listed below. Region coverage is reported next to lines and, with --baseline,

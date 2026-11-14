@@ -51,11 +51,11 @@ cert() { # name subject extensions issuer not_before not_after
   fi
 }
 
-cert root "/CN=ZTron Test Root CA/O=ztron-paywall-kit fixtures" v3_ca self 20100101000000Z 20400101000000Z
-cert int "/CN=ZTron Test Intermediate CA/O=ztron-paywall-kit fixtures" v3_int root 20100101000000Z 20400101000000Z
-cert leaf "/CN=ZTron Test Receipt Signing/O=ztron-paywall-kit fixtures" v3_leaf int 20240101000000Z 20340101000000Z
-cert leaf-expired "/CN=ZTron Test Receipt Signing 2015/O=ztron-paywall-kit fixtures" v3_leaf int 20150101000000Z 20160101000000Z
-cert leaf-nomarker "/CN=ZTron Test Other Signing/O=ztron-paywall-kit fixtures" v3_leaf_nomarker int 20240101000000Z 20340101000000Z
+cert root "/CN=ZTron Test Root CA/O=ZTronPaywallKit fixtures" v3_ca self 20100101000000Z 20400101000000Z
+cert int "/CN=ZTron Test Intermediate CA/O=ZTronPaywallKit fixtures" v3_int root 20100101000000Z 20400101000000Z
+cert leaf "/CN=ZTron Test Receipt Signing/O=ZTronPaywallKit fixtures" v3_leaf int 20240101000000Z 20340101000000Z
+cert leaf-expired "/CN=ZTron Test Receipt Signing 2015/O=ZTronPaywallKit fixtures" v3_leaf int 20150101000000Z 20160101000000Z
+cert leaf-nomarker "/CN=ZTron Test Other Signing/O=ZTronPaywallKit fixtures" v3_leaf_nomarker int 20240101000000Z 20340101000000Z
 
 # The receipt payload: SET OF SEQUENCE { type INTEGER, version INTEGER, value OCTET STRING }, Apple's field numbers.
 payload() { # out bundle creation_date_or_empty

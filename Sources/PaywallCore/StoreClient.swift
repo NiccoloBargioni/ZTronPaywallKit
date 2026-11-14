@@ -128,7 +128,9 @@ public protocol StoreClient: Sendable {
     /// App Store. Empty and finished where the OS has no such API. One stream per call.
     func purchaseIntents() async -> AsyncStream<String>
     func products(for ids: Set<String>) async throws -> [PaywallProduct]
-    func purchase(productID: String) async throws -> StorePurchaseResult
+    /// `product.purchase(options:)`. With `offer`, the options carry `Product.PurchaseOption.promotionalOffer(_:compactJWS:)`:
+    /// the JWS the app's server signed for this install (`PromotionalOfferSigner`), good for this one request.
+    func purchase(productID: String, offer: SignedPromotionalOffer?) async throws -> StorePurchaseResult
     /// `AppStore.sync()`. Can prompt for sign-in: user-initiated only.
     func sync() async throws
     /// `transaction.finish()`.
@@ -138,4 +140,11 @@ public protocol StoreClient: Sendable {
     func isEligibleForIntroOffer(groupID: String) async -> Bool
     /// `Storefront.current?.countryCode`: the country the prices and offers are for. `nil` where the store cannot say.
     func storefrontCountryCode() async -> String?
+}
+
+extension StoreClient {
+    /// A plain purchase: no offer.
+    public func purchase(productID: String) async throws -> StorePurchaseResult {
+        try await purchase(productID: productID, offer: nil)
+    }
 }

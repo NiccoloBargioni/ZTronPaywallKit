@@ -39,11 +39,11 @@ public struct LeaseRecord: Codable, Hashable, Sendable {
     public let expiresAt: Date
 }
 
-/// Events written before any account key was known. Counted for every account (see README, "Accounts").
+/// Events written before any account key was known. Counted for every account (see HANDBOOK.md, "Accounts").
 public let unboundAccountKey = "unbound"
 
 /// The derived state of a `Ledger` at one point of its history: what the ledger keeps instead of the events, written
-/// to `ledger.log` as a `.checkpoint` entry so compaction can drop the events it stands for (README, "Retention").
+/// to `ledger.log` as a `.checkpoint` entry so compaction can drop the events it stands for (HANDBOOK.md, "Retention").
 ///
 /// It carries everything a later event may still refer to, so a replay from it equals a replay of the whole history
 /// (`LedgerIncrementalTests` proves it over random histories): the balances with their cross-account parts, the lease

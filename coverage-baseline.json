@@ -4,15 +4,15 @@
     "regions": 86.81
   },
   "PaywallCore": {
-    "lines": 99.76,
-    "regions": 98.42
+    "lines": 99.77,
+    "regions": 98.44
   },
   "PaywallKit": {
-    "lines": 98.13,
-    "regions": 83.8
+    "lines": 98.18,
+    "regions": 84.09
   },
   "PaywallSimulator": {
-    "lines": 98.11,
+    "lines": 98.12,
     "regions": 91.71
   },
   "PaywallTesting": {

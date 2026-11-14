@@ -25,11 +25,12 @@ struct Boom: Error {}
 /// what the test grants.
 @MainActor
 func makePaywall(
-    entitlements: [StoreTransaction] = [], tokens: Int = 0, audit: [any PaywallAuditSink] = [], welcomeTokens: Int = 0
+    entitlements: [StoreTransaction] = [], tokens: Int = 0, audit: [any PaywallAuditSink] = [], welcomeTokens: Int = 0,
+    signer: (any PromotionalOfferSigner)? = nil
 ) async -> (Paywall, FakeStore, FakeClock) {
     let paywall = Paywall()
-    let store = FakeStore(entitlements: entitlements, products: products)
     let clock = FakeClock()
+    let store = FakeStore(entitlements: entitlements, products: products, now: { await clock.now })
     var configuration = Paywall.Configuration(catalog: catalog)
     configuration.welcomeTokens = welcomeTokens
     configuration.store = store
@@ -38,6 +39,7 @@ func makePaywall(
     configuration.includesDefaultAudit = false
     configuration.connectivity = nil
     configuration.audit = audit
+    configuration.promotionalOfferSigner = signer
     paywall.configure(configuration)
     await paywall.waitUntilStarted()
     if tokens > 0 { paywall.grant(tokens: tokens, reason: "test") }

@@ -73,6 +73,8 @@
             configuration.connectivity = connectivity
             configuration.storageDirectory = directory
             configuration.environmentLabel = "simulated"
+            // A debug build takes a promotional offer without a server: the fake answers with a JWS-shaped token.
+            configuration.promotionalOfferSigner = FakePromotionalOfferSigner()
             configuration.grandfathering = self.grandfathering
             configuration.tolerance = simulation.tolerance ?? configuration.tolerance
             configuration.includesDefaultAudit = true

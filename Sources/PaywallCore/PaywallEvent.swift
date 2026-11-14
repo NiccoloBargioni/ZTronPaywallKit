@@ -61,6 +61,9 @@ public enum PaywallEvent: Hashable, Codable, Sendable {
     /// The user tapped a promoted in-app purchase on the App Store (`PurchaseIntent`, iOS 16.4+). The host opens
     /// its paywall on `productID`; the engine buys nothing on its own.
     case purchaseIntent(productID: String)
+    /// The signer answered for a purchase with a promotional offer: the store is about to be asked to buy with it. The
+    /// `.purchase` events around it say how that went.
+    case promotionalOfferSigned(productID: String, offerID: String)
     case grandfathered(originalAppVersion: String, originalPurchaseDate: Date, environment: StoreEnvironment)
     case storeUnavailable(error: String, snapshotAge: TimeInterval?)
     case syncMerged(count: Int, fromDeviceIDs: [String])

@@ -10,7 +10,7 @@ import SwiftUI
 struct TestHostApp: App {
     var body: some Scene {
         WindowGroup {
-            Text("ztron-paywall-kit test host")
+            Text("ZTronPaywallKit test host")
                 .padding()
         }
     }

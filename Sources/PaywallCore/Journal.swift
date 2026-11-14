@@ -40,7 +40,7 @@ public enum JournalError: Error, Hashable, Sendable {
 ///
 /// A compacted log starts with a `.checkpoint`, followed by the events the carrier has not acknowledged yet (which
 /// the checkpoint already counts) and the events appended since. The engine writes the checkpoint; see "Retention"
-/// in the README for when.
+/// in HANDBOOK.md for when.
 ///
 /// Not thread-safe by design: the `@MainActor` engine owns the only instance.
 public final class Journal {

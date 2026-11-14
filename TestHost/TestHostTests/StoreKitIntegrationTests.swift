@@ -1,4 +1,5 @@
 import Combine
+import CryptoKit
 import Foundation
 import StoreKit
 import StoreKitTest
@@ -46,7 +47,9 @@ extension HostLane {
 struct StoreKitIntegrationTests {
     /// A fresh StoreKit test environment and a freshly configured `Paywall.shared` on an empty directory. No welcome
     /// tokens unless the test asks: the balance is what it buys.
-    private func start(timeRate: SKTestSession.TimeRate = .realTime, welcomeTokens: Int = 0) async throws -> (SKTestSession, EventLog) {
+    private func start(
+        timeRate: SKTestSession.TimeRate = .realTime, welcomeTokens: Int = 0, signer: (any PromotionalOfferSigner)? = nil
+    ) async throws -> (SKTestSession, EventLog) {
         let url = try #require(Bundle(for: HostBundleMarker.self).url(forResource: "Paywall", withExtension: "storekit"))
         let session = try SKTestSession(contentsOf: url)
         session.resetToDefaultState()
@@ -58,6 +61,7 @@ struct StoreKitIntegrationTests {
         configuration.storageDirectory = makeTemporaryPaywallDirectory()
         configuration.includesDefaultAudit = false
         configuration.connectivity = nil
+        configuration.promotionalOfferSigner = signer
         Paywall.shared.configure(configuration)
         let log = EventLog()
         log.subscription = Paywall.shared.events.sink { log.events.append($0) }
@@ -295,6 +299,57 @@ struct StoreKitIntegrationTests {
         #expect(log.events.contains(.restore(stage: .completed)))
     }
 
+    /// A lapsed subscriber takes the monthly plan's promotional offer. The signer is asked for this install's JWS (the
+    /// host's bundle, the product, the offer, the app transaction id), the store buys with
+    /// `Product.PurchaseOption.promotionalOffer(_:compactJWS:)`, and the transaction StoreKit reports carries the offer.
+    /// With `PAYWALL_OFFER_SIGNER_URL` set the JWS comes from the worker running there (the live signer lane); otherwise
+    /// from the test key pair in `Paywall.storekit`, minting the worker's exact output. Either way the local store server
+    /// verifies the signature against the configuration file's key pair before it accepts the purchase.
+    @Test func a_lapsed_subscriber_buys_with_the_monthly_plans_promotional_offer() async throws {
+        let configuration = try #require(Bundle(for: HostBundleMarker.self).url(forResource: "Paywall", withExtension: "storekit"))
+        let local = try ThrowawayPromotionalOfferSigner(configuration: configuration)
+        let remote = ProcessInfo.processInfo.environment["PAYWALL_OFFER_SIGNER_URL"].flatMap(URL.init(string:))
+            .map { RemotePromotionalOfferSigner(endpoint: $0.appendingPathComponent("v1/promotional-offers/sign")) }
+        let (session, log) = try await start(signer: remote ?? local)
+        guard case .purchased = try await Paywall.shared.purchase(try await product("pro.monthly")) else { Issue.record("monthly"); return }
+        try session.expireSubscription(productIdentifier: "pro.monthly")
+        await Paywall.shared.refresh()
+        #expect(await waitUntil { Paywall.shared.entitlement == .free })
+
+        let monthly = try await product("pro.monthly")
+        let comeback = try #require(monthly.offers.first { $0.kind == .promotional })
+        let outcome = try await Paywall.shared.purchase(monthly, promotionalOffer: comeback)
+        guard case .purchased(let id) = outcome else { Issue.record("expected a purchase, got \(outcome)"); return }
+        #expect(log.events.contains(.promotionalOfferSigned(productID: "pro.monthly", offerID: "comeback")))
+        #expect(log.events.contains(.purchase(stage: .completed, productID: "pro.monthly", source: nil, transactionID: id)))
+        if case .subscribed(let subscription) = Paywall.shared.entitlement {
+            #expect(subscription.tier == .monthly)
+        } else {
+            Issue.record("expected a subscription, got \(Paywall.shared.entitlement)")
+        }
+
+        if remote == nil {
+            // The request named this app and bound the signature to its app transaction.
+            let request = try #require(await local.requests.last)
+            #expect(request.bundleID == Bundle.main.bundleIdentifier)
+            #expect(request.productID == "pro.monthly" && request.offerID == "comeback")
+            let engine = try #require(Paywall.shared.engine)
+            #expect(request.transactionID == engine.appTransaction?.appTransactionID)
+            if #available(iOS 18.4, *) { #expect(request.transactionID != nil, "AppTransaction.appTransactionID binds the offer to this customer") }
+        }
+
+        // StoreKit's own record of the purchase names the offer.
+        if #available(iOS 17.2, *) {
+            var redeemed: (id: String?, type: Transaction.OfferType?)?
+            for await result in Transaction.currentEntitlements {
+                guard case .verified(let transaction) = result, transaction.id == id else { continue }
+                redeemed = (transaction.offer?.id, transaction.offer?.type)
+            }
+            #expect(redeemed?.id == "comeback")
+            #expect(redeemed?.type == .promotional)
+        }
+    }
+
     @Test func the_configuration_file_matches_the_host_catalog() throws {
         let url = try #require(Bundle(for: HostBundleMarker.self).url(forResource: "Paywall", withExtension: "storekit"))
         #expect(try hostCatalog.mismatches(withStoreKitConfiguration: Data(contentsOf: url)).isEmpty)
@@ -306,5 +361,51 @@ extension Entitlement {
     fileprivate var expiresAt: Date? {
         if case .subscribed(let subscription) = self { return subscription.expiresAt }
         return nil
+    }
+}
+
+/// What `Workers/PromotionalOfferSigner` mints, on the test key pair stored in `Paywall.storekit`
+/// (its top-level `subscriptionOffersKeyPair`), so the lane needs no server: the ES256 compact JWS with Apple's header and
+/// claims. StoreKit Testing's local store server verifies promotional offer signatures against that same key pair.
+/// Records every request.
+actor ThrowawayPromotionalOfferSigner: PromotionalOfferSigner {
+    private let key: P256.Signing.PrivateKey
+    private let keyID: String
+    private(set) var requests: [PromotionalOfferSigningRequest] = []
+
+    /// Reads the key pair (`id`, base64 PKCS#8 DER `privateKey`) from the StoreKit configuration file at `url`.
+    init(configuration url: URL) throws {
+        struct Configuration: Decodable {
+            struct KeyPair: Decodable { var id: String; var privateKey: String }
+            var subscriptionOffersKeyPair: KeyPair
+        }
+        let pair = try JSONDecoder().decode(Configuration.self, from: Data(contentsOf: url)).subscriptionOffersKeyPair
+        guard let der = Data(base64Encoded: pair.privateKey, options: .ignoreUnknownCharacters) else {
+            throw DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "privateKey is not base64"))
+        }
+        key = try P256.Signing.PrivateKey(derRepresentation: der)
+        keyID = pair.id
+    }
+
+    func sign(_ request: PromotionalOfferSigningRequest) throws -> SignedPromotionalOffer {
+        requests.append(request)
+        var claims: [String: Any] = [
+            "iss": "57246542-96fe-1a63-e053-0824d011072a", "iat": Int(Date().timeIntervalSince1970), "aud": "promotional-offer",
+            "bid": request.bundleID, "nonce": UUID().uuidString.lowercased(), "productId": request.productID,
+            "offerIdentifier": request.offerID,
+        ]
+        if let transactionID = request.transactionID { claims["transactionId"] = transactionID }
+        let input = "\(try Self.segment(["alg": "ES256", "kid": keyID, "typ": "JWT"])).\(try Self.segment(claims))"
+        let signature = try key.signature(for: Data(input.utf8)).rawRepresentation
+        return SignedPromotionalOffer(productID: request.productID, offerID: request.offerID, compactJWS: "\(input).\(Self.base64URL(signature))")
+    }
+
+    private static func segment(_ object: [String: Any]) throws -> String {
+        base64URL(try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]))
+    }
+
+    private static func base64URL(_ data: Data) -> String {
+        data.base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
     }
 }

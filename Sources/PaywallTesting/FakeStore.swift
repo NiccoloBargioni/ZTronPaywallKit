@@ -23,21 +23,28 @@ public actor FakeStore: StoreClient {
     public private(set) var finished: [UInt64] = []
     public private(set) var syncCalls = 0
     public private(set) var purchaseCalls = 0
+    /// The offer each `purchase(productID:offer:)` was handed, in order: `nil` for a plain purchase.
+    public private(set) var purchaseOffers: [SignedPromotionalOffer?] = []
     private var nextTransactionID: UInt64 = 1_000
 
     public enum NextPurchase: Hashable, Sendable { case succeed, pending, cancel, fail }
 
     private var listeners: [UUID: AsyncStream<StoreTransaction>.Continuation] = [:]
     private var intentListeners: [UUID: AsyncStream<String>.Continuation] = [:]
+    /// Dates purchases: the wall clock unless the test passes its `FakeClock` (`{ await clock.now }`), so a bought
+    /// subscription expires on the clock the engine reads (the fake clock's default day is in 2027).
+    public let now: @Sendable () async -> Date
 
     public init(
         entitlements: [StoreTransaction] = [],
         app: AppTransactionSnapshot? = nil,
-        products: [PaywallProduct] = []
+        products: [PaywallProduct] = [],
+        now: @escaping @Sendable () async -> Date = { Date() }
     ) {
         self.entitlements = entitlements
         self.app = app
         self.catalogProducts = products
+        self.now = now
     }
 
     private func broadcast(_ transaction: StoreTransaction) {
@@ -138,23 +145,25 @@ public actor FakeStore: StoreClient {
 
     public func storefrontCountryCode() async -> String? { storefrontCountry }
 
-    public func purchase(productID: String) async throws -> StorePurchaseResult {
+    public func purchase(productID: String, offer: SignedPromotionalOffer?) async throws -> StorePurchaseResult {
         purchaseCalls += 1
+        purchaseOffers.append(offer)
         guard hasNetwork, isReachable else { throw Failure.network }
         switch nextPurchase {
         case .succeed:
             let kind = catalogProducts.first { $0.id == productID }?.kind
+            let now = await now()
             let type: StoreTransaction.ProductType
             var expiration: Date?
             switch kind {
             case .subscription(let tier):
                 type = .autoRenewable
-                expiration = Date().addingTimeInterval(TimeInterval(tier.periodInDays) * 86_400)
+                expiration = now.addingTimeInterval(TimeInterval(tier.periodInDays) * 86_400)
             case .lifetime: type = .nonConsumable
             case .tokens, .none: type = .consumable
             }
             let transaction = StoreTransaction(
-                id: makeTransactionID(), productID: productID, productType: type, purchaseDate: Date(),
+                id: makeTransactionID(), productID: productID, productType: type, purchaseDate: now,
                 expirationDate: expiration)
             if type != .consumable { entitlements.append(transaction) }
             history.append(transaction)

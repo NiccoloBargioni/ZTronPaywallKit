@@ -206,12 +206,16 @@ extension GateEngine {
     // MARK: Purchases
 
     /// The credit is written before `finish()`: if the app dies in between, `Transaction.updates` re-delivers the
-    /// transaction and the deterministic credit id makes the second write a no-op.
-    public func purchase(productID: String, source: PaywallSource?) async throws -> PurchaseOutcome {
+    /// transaction and the deterministic credit id makes the second write a no-op. With `offer`, a promotional offer of
+    /// the product, the signer is asked for this install's signature first and the store buys with it; a signing
+    /// failure fails the purchase before the payment sheet, like a store error.
+    public func purchase(productID: String, offer: PaywallProduct.Offer? = nil, source: PaywallSource?) async throws -> PurchaseOutcome {
         emit(.purchase(stage: .started, productID: productID, source: source, transactionID: nil))
         let result: StorePurchaseResult
         do {
-            result = try await store.purchase(productID: productID)
+            var signed: SignedPromotionalOffer?
+            if let offer { signed = try await signPromotionalOffer(offer, productID: productID) }
+            result = try await store.purchase(productID: productID, offer: signed)
         } catch {
             emit(.purchase(stage: .failed(String(describing: error)), productID: productID, source: source, transactionID: nil))
             throw error
@@ -235,6 +239,23 @@ extension GateEngine {
             emit(.purchase(stage: .cancelled, productID: productID, source: source, transactionID: nil))
             return .cancelled
         }
+    }
+
+    /// Asks the signer for this install's signature of `offer` on `productID`: the one-time JWS the store takes. The
+    /// request names the app (the settings' bundle id, else the app transaction's), the product, the offer and the
+    /// app transaction id when the store reported one, so the App Store can bind the offer to this customer.
+    func signPromotionalOffer(_ offer: PaywallProduct.Offer, productID: String) async throws -> SignedPromotionalOffer {
+        guard offer.kind == .promotional, let offerID = offer.id else { throw PromotionalOfferError.notPromotional }
+        guard let signer = promotionalOfferSigner else { throw PromotionalOfferError.signerNotConfigured }
+        guard let bundleID = settings.bundleID ?? appTransaction?.bundleID else { throw PromotionalOfferError.bundleIDUnknown }
+        let request = PromotionalOfferSigningRequest(
+            bundleID: bundleID, productID: productID, offerID: offerID, transactionID: appTransaction?.appTransactionID)
+        let signed = try await signer.sign(request)
+        guard signed.productID == productID, signed.offerID == offerID else {
+            throw PromotionalOfferError.signatureMismatch(received: signed)
+        }
+        emit(.promotionalOfferSigned(productID: productID, offerID: offerID))
+        return signed
     }
 
     /// `AppStore.sync()` then re-resolve, then pull the token history. Wire it to the Restore button only.

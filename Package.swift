@@ -95,7 +95,7 @@ var targets: [Target] = [
 #endif
 
 let package = Package(
-    name: "ztron-paywall-kit",
+    name: "ZTronPaywallKit",
     platforms: [
         .iOS(.v15),
         .macOS(.v12),

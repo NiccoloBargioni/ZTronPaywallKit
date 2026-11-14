@@ -37,6 +37,7 @@ final class Harness {
     let clock: FakeClock
     let sync: InMemoryLedgerSync?
     let connectivity: FakeConnectivity?
+    let promotionalOfferSigner: (any PromotionalOfferSigner)?
     let audit: InMemoryAuditSink
     var settings: GateEngine.Settings
     let grandfathering: GrandfatheringPolicy?
@@ -49,6 +50,7 @@ final class Harness {
         clock: FakeClock = FakeClock(),
         sync: InMemoryLedgerSync? = nil,
         connectivity: FakeConnectivity? = nil,
+        promotionalOfferSigner: (any PromotionalOfferSigner)? = nil,
         audit: InMemoryAuditSink = InMemoryAuditSink(),
         settings: GateEngine.Settings = GateEngine.Settings(tolerance: 300, appVersion: "2.0", build: "200"),
         grandfathering: GrandfatheringPolicy? = nil
@@ -58,12 +60,13 @@ final class Harness {
         self.clock = clock
         self.sync = sync
         self.connectivity = connectivity
+        self.promotionalOfferSigner = promotionalOfferSigner
         self.audit = audit
         self.settings = settings
         self.grandfathering = grandfathering
         self.engine = try GateEngine(
             directory: directory, catalog: catalog, grandfathering: grandfathering, settings: settings, clock: clock,
-            store: store, sync: sync, connectivity: connectivity, audit: [audit])
+            store: store, promotionalOfferSigner: promotionalOfferSigner, sync: sync, connectivity: connectivity, audit: [audit])
         engine.onEvent = { [weak self] in self?.events.append($0) }
     }
 
@@ -74,7 +77,7 @@ final class Harness {
         engine.shutdown()
         engine = try GateEngine(
             directory: directory, catalog: catalog, grandfathering: grandfathering, settings: settings, clock: clock,
-            store: store, sync: sync, connectivity: connectivity, audit: [audit])
+            store: store, promotionalOfferSigner: promotionalOfferSigner, sync: sync, connectivity: connectivity, audit: [audit])
         events = []
         engine.onEvent = { [weak self] in self?.events.append($0) }
         if start { await engine.start() }
