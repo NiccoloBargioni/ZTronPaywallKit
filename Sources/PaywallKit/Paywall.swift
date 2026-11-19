@@ -52,6 +52,11 @@ public final class Paywall: ObservableObject {
         public var promotionalOfferSigner: (any PromotionalOfferSigner)?
         /// Where the journal lives. Default: Application Support/ztron.paywall.
         public var storageDirectory: URL?
+        /// Authenticates the caches next to the journal (`app-transaction.json`, `entitlement.json`) with a key that
+        /// never leaves this install, so an edited container or a restored backup cannot plant a paying entitlement.
+        /// The default keeps the key in the Keychain (this device only, after first unlock); tests pass
+        /// `InMemoryFileKeyStore`. `nil` leaves the files plain and trusted, which no shipping app should want.
+        public var fileKeyStore: (any PaywallFileKeyStore)? = KeychainFileKeyStore()
         /// Written into every audit record instead of the store environment (`"simulated"`).
         public var environmentLabel: String?
         /// `F_FULLFSYNC` on the draw path (default) or `fsync` only.
@@ -112,6 +117,17 @@ public final class Paywall: ObservableObject {
 
     public private(set) var engine: GateEngine?
     public private(set) var configuration: Configuration?
+    /// The `.paywallGated` views on screen, as the facade knows them: a reconfigure reopens each on the new engine
+    /// (or in the new mode) and delivers its new decision, so no view keeps a dead engine's decision.
+    struct LiveSession {
+        var level: GateLevel
+        var policy: TokenPolicy
+        var source: PaywallSource
+        var scope: String?
+        var onChange: (GateSessionState) -> Void
+        var state: GateSessionState
+    }
+    var liveSessions: [UUID: LiveSession] = [:]
     /// The `PaywallServiceProvider` that configured this facade, when the app installed one at its root; `nil` for a
     /// facade configured directly. `PaywallHostingController` re-injects it under UIKit layers.
     public internal(set) weak var provider: PaywallServiceProvider?
@@ -131,6 +147,7 @@ public final class Paywall: ObservableObject {
     /// then resolves the entitlement and starts the `Transaction.updates` listener. Calling it again tears the
     /// previous engine down first.
     public func configure(_ configuration: Configuration) {
+        let previous = engine
         teardown()
         let problems = configuration.catalog.validate()
         if configuration.passthrough {
@@ -142,11 +159,13 @@ public final class Paywall: ObservableObject {
             configurationError = nil
             self.configuration = configuration
             isPassthrough = true
+            reopenLiveSessions()
             return
         }
         guard problems.isEmpty else {
             logger.error("paywall: invalid catalog", metadata: ["problems": "\(problems)"])
             configurationError = .invalidCatalog(problems)
+            reopenLiveSessions()
             return
         }
         let directory = configuration.storageDirectory ?? Configuration.defaultStorageDirectory
@@ -180,10 +199,11 @@ public final class Paywall: ObservableObject {
                 settings: settings, clock: configuration.clock, store: configuration.store,
                 promotionalOfferSigner: configuration.promotionalOfferSigner, sync: configuration.sync,
                 connectivity: configuration.connectivity,
-                audit: sinks)
+                audit: sinks, fileKeyStore: configuration.fileKeyStore)
         } catch {
             logger.error("paywall: journal unavailable", metadata: ["error": "\(error)"])
             configurationError = .journalUnavailable(error)
+            reopenLiveSessions()
             return
         }
         configurationError = nil
@@ -191,12 +211,46 @@ public final class Paywall: ObservableObject {
         self.engine = engine
         engine.onEvent = { [weak self] event in self?.publish(event) }
         engine.onStateChange = { [weak self] in self?.mirror() }
+        // A purchase that completes on an engine this facade has since replaced goes to whichever engine is current.
+        engine.onOrphanedPurchase = { [weak self] transaction, source in
+            guard let self, let current = self.engine else { return false }
+            return await current.adoptPurchase(transaction, source: source)
+        }
         if let center = configuration.notificationCenter { notificationBridge = bridgeToNotificationCenter(center) }
         mirror()
         let onStart = configuration.onStart
-        startTask = Task {
+        startTask = Task { [weak self] in
+            // The predecessor's audit records land before the successor reads where the chain ends.
+            await previous?.flushAudit()
             await engine.start()
+            if let self, self.engine === engine { self.reopenLiveSessions() }
             await onStart?(engine)
+        }
+    }
+
+    /// Every `.paywallGated` view still on screen is decided again by the engine (or the mode) in effect now, and told.
+    /// A view that was open through a lease it held on the old engine is pinned first: what the user paid for stays,
+    /// and nothing draws a second time.
+    private func reopenLiveSessions() {
+        for (holder, live) in liveSessions {
+            let state: GateSessionState
+            if let engine {
+                if case .open(let mode) = live.state.decision, Self.holdsLease(mode) { engine.leases.pin(live.source.id, holder: holder) }
+                state = engine.openSession(
+                    holder: holder, level: live.level, policy: live.policy, source: live.source, scope: live.scope,
+                    onChange: tracking(holder, live.onChange))
+            } else {
+                state = fixedSessionState(holder: holder, level: live.level, source: live.source, scope: live.scope)
+            }
+            liveSessions[holder]?.state = state
+            live.onChange(state)
+        }
+    }
+
+    private static func holdsLease(_ mode: GateOpenMode) -> Bool {
+        switch mode {
+        case .leased, .drawn: return true
+        case .free, .paying, .reserved, .affordable: return false
         }
     }
 
@@ -208,6 +262,8 @@ public final class Paywall: ObservableObject {
     private func teardown() {
         startTask?.cancel()
         startTask = nil
+        // `shutdown()` drops the old engine's view sessions; the facade reopens the live ones on the successor.
+        // `onOrphanedPurchase` stays: it reads the engine current at the time a late purchase lands.
         engine?.shutdown()
         engine?.onEvent = nil
         engine?.onStateChange = nil
@@ -373,19 +429,39 @@ public final class Paywall: ObservableObject {
         holder: UUID, level: GateLevel, policy: TokenPolicy, source: PaywallSource, scope: String?,
         onChange: @escaping (GateSessionState) -> Void
     ) -> GateSessionState {
-        guard let engine else {
-            if level == .free || isPassthrough {
-                return GateSessionState(holder: holder, level: level, source: source, scope: scope, decision: .open(.free))
-            }
-            let failure = unconfiguredFailure(level, source: source, scope: scope)
-            publish(.gateDenied(failure))
-            return GateSessionState(
-                holder: holder, level: level, source: source, scope: scope, decision: .closed(failure.reason), failure: failure)
+        let state: GateSessionState
+        if let engine {
+            state = engine.openSession(
+                holder: holder, level: level, policy: policy, source: source, scope: scope, onChange: tracking(holder, onChange))
+        } else {
+            state = fixedSessionState(holder: holder, level: level, source: source, scope: scope)
         }
-        return engine.openSession(holder: holder, level: level, policy: policy, source: source, scope: scope, onChange: onChange)
+        liveSessions[holder] = LiveSession(level: level, policy: policy, source: source, scope: scope, onChange: onChange, state: state)
+        return state
     }
 
-    func closeSession(holder: UUID) { engine?.closeSession(holder: holder) }
+    /// With no engine: open as `.free` in passthrough (and for `.free`), closed otherwise.
+    private func fixedSessionState(holder: UUID, level: GateLevel, source: PaywallSource, scope: String?) -> GateSessionState {
+        if level == .free || isPassthrough {
+            return GateSessionState(holder: holder, level: level, source: source, scope: scope, decision: .open(.free))
+        }
+        let failure = unconfiguredFailure(level, source: source, scope: scope)
+        publish(.gateDenied(failure))
+        return GateSessionState(holder: holder, level: level, source: source, scope: scope, decision: .closed(failure.reason), failure: failure)
+    }
+
+    /// The engine's `onChange`, keeping the facade's copy of the view's state current on the way.
+    private func tracking(_ holder: UUID, _ onChange: @escaping (GateSessionState) -> Void) -> (GateSessionState) -> Void {
+        { [weak self] next in
+            self?.liveSessions[holder]?.state = next
+            onChange(next)
+        }
+    }
+
+    func closeSession(holder: UUID) {
+        liveSessions[holder] = nil
+        engine?.closeSession(holder: holder)
+    }
 
     // MARK: Store
 

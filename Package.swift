@@ -6,6 +6,9 @@ import PackageDescription
 
 var products: [Product] = [
     .library(name: "ZTronPaywallCore", targets: ["PaywallCore"]),
+    // Debug builds and test targets only: every source file is wrapped in `#if DEBUG`, so a release build of an app that
+    // links it (directly, or through ZTronPaywallSimulator) ships none of the fakes, and a non-debug reference to one
+    // is a compile error. `Scripts/check-release-symbols.sh` checks that it defines no Swift symbol in release.
     .library(name: "ZTronPaywallTesting", targets: ["PaywallTesting"]),
 ]
 
@@ -38,7 +41,9 @@ var targets: [Target] = [
     products += [
         .library(name: "ZTronPaywallKit", targets: ["PaywallKit"]),
         .library(name: "ZTronPaywallCloudSync", targets: ["PaywallCloudSync"]),
-        // Link from Debug configurations only: every source file is wrapped in `#if DEBUG`.
+        // Link from Debug configurations only: every source file is wrapped in `#if DEBUG`, in this module and in the
+        // PaywallTesting module it depends on, so the two compile to nothing in release (checked by
+        // `Scripts/check-release-symbols.sh`).
         .library(name: "ZTronPaywallSimulator", targets: ["PaywallSimulator"]),
     ]
     targets += [

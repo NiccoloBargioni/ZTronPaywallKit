@@ -31,7 +31,9 @@ public struct LedgerEvent: Codable, Hashable, Identifiable, Sendable {
     public let accountKey: String
     /// The gate, for debits and refunds.
     public let source: PaywallSource?
-    /// SHA-256 of the previous event written by the same device: tamper evidence, per device stream.
+    /// SHA-256 of the previous event written by the same device: a hash chain per device stream, which detects
+    /// corruption and edits that do not rewrite the events after them. Not tamper-proof against whoever controls the
+    /// device: the chain is unkeyed and its head is not anchored anywhere else.
     public let previousHash: String
     public let kind: Kind
 

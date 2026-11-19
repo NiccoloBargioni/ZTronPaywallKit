@@ -4,7 +4,9 @@ public enum GateLevel: Hashable, Codable, Sendable {
     case free
     /// Any active subscription, the lifetime purchase, or a grandfathered install.
     case paid
-    /// `N` tokens per use. Paying users pass without a draw.
+    /// `N` tokens per draw, with a lease of `tolerance` seconds on the gate id: within it the same id opens free, and a
+    /// gated view that holds the lease pins it for as long as it is on screen (see HANDBOOK.md, "Gating"). Paying users
+    /// pass without a draw.
     case tokens(Int)
 
     /// The tokens a non-paying user is asked for, `0` for `.free` and `.paid`.

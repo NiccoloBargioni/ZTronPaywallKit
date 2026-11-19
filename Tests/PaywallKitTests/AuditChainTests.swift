@@ -12,6 +12,7 @@ struct AuditChainTests {
     @Test func verify_audit_chain_stays_intact_after_rotation_dropped_files() async throws {
         let paywall = Paywall()
         var configuration = Paywall.Configuration(catalog: catalog)
+        configuration.fileKeyStore = InMemoryFileKeyStore()
         configuration.store = FakeStore(products: products)
         let clock = FakeClock()
         configuration.clock = clock

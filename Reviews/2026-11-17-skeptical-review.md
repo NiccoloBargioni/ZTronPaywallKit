@@ -1,6 +1,8 @@
 # Skeptical review 1: ZTronPaywallKit at `b5c20e4`
 
-**Status.** Open. Written on 2026-11-17 as input for the next fix cycle; none of it is fixed yet.\
+**Status.** Closed on 2026-11-19: every finding below was fixed, with a regression test, in the cycle recorded in
+`Reviews/2026-11-19-fix-plan.md` (per-finding statuses there). Line numbers in this file refer to `b5c20e4`, not to the
+tree after the fixes. Written on 2026-11-17 as input for that cycle.\
 **Scope.** The whole repository at commit `b5c20e4` (`main`, clean tree): the Swift package, the TestHost project, the promotional-offer signing worker, the scripts, CI and the docs.\
 **Result.** 25 verified findings (1 critical, 3 high, 10 medium, 11 low). 12 hold as reported; 13 hold in a narrower form than first reported. None was refuted. There are also ten docs-vs-code corrections (D1 to D10) and one operational item (O1).\
 **Sensitivity.** Several findings describe weaknesses someone could exploit (A1's token reset, B1, A11+B6, B3, B4, B5). Keep this file out of the public repository until they are fixed or accepted.

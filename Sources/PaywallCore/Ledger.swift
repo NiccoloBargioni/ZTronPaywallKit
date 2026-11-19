@@ -17,7 +17,9 @@ public struct WalletSnapshot: Codable, Hashable, Sendable {
 
 /// The token wallet as views see it.
 public struct Wallet: Hashable, Sendable {
-    /// Credits + grants + refunds − debits − revocations. Negative after a pack refund.
+    /// Credits + grants + refunds − debits − revocations. Negative after a pack refund, or once the devices of one
+    /// account spent the same tokens before their ledgers met (each decides against the balance it last pulled); token
+    /// gates stay closed until it is repaid. Show `available` to the user.
     public let balance: Int
     /// Held by live reservations on this device.
     public let reserved: Int
@@ -230,11 +232,12 @@ public struct Ledger: Hashable, Sendable {
         lastEvents[deviceID]?.hash ?? checkpointHeads[deviceID] ?? paywallGenesisHash
     }
 
-    /// The derived balance for one account. With a `baseline` (the Keychain snapshot) whose last event this
-    /// ledger has not seen yet, the baseline stands in for the history that has not synced back.
+    /// The derived balance for one account. With a `baseline` (the Keychain snapshot) for that account whose last
+    /// event this ledger has not seen, the baseline stands in for the history that has not synced back. A baseline
+    /// that names no last event (written by an install with no events of its own) stands until the engine settles it.
     public func balance(for accountKey: String, baseline: WalletSnapshot? = nil) -> Int {
         let total = balances.total(for: accountKey)
-        if let baseline, baseline.accountKey == accountKey, let last = baseline.lastEventID, !contains(last) {
+        if let baseline, baseline.accountKey == accountKey, !(baseline.lastEventID.map(contains) ?? false) {
             return baseline.balance + total
         }
         return total

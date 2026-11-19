@@ -162,9 +162,10 @@ struct AuditTableTests {
         #expect(record.event == .grandfathered(originalAppVersion: "90", originalPurchaseDate: bought, environment: .production))
     }
 
+    /// A host-written store client whose reads throw; StoreKit's never do, so the shipped client never produces this.
     @Test func storeUnavailable_carries_the_error_and_snapshot_age() async throws {
         let h = try await Harness.free()
-        await h.store.setReachable(false)
+        await h.store.setPassiveReadFailure(.unreachable)
         h.clock.advance(by: 120)
         await h.engine.refresh(cause: .foreground)
         let record = try first(await h.records()) { if case .storeUnavailable = $0 { true } else { false } }

@@ -266,15 +266,22 @@ struct CloudKitDatabaseTests {
         await #expect(throws: URLError.self) { _ = try await database.fetchChanges(since: nil) }
     }
 
-    @Test func carrier_over_the_cloudkit_database_pushes_pulls_and_persists_a_token_file() async throws {
+    /// A6/A7: the carrier keeps no position of its own. The cursor a pull hands back is the engine's to store with the
+    /// merged events, and the legacy token file an earlier build left is deleted.
+    @Test func carrier_over_the_cloudkit_database_pushes_and_pulls_from_the_cursor_it_is_given() async throws {
         let (database, _) = makeDatabase()
         let tokenURL = makeTemporaryPaywallDirectory().appendingPathComponent("cloudkit.token")
+        try Data("stale".utf8).write(to: tokenURL)
         let carrier = PaywallCloudSync(database: database, keychain: nil, minimumPullInterval: 0, tokenURL: tokenURL)
         #expect(try await carrier.push([event("grant:1", tokens: 3)]) == ["grant:1"])
-        #expect(try await carrier.pull().map(\.id) == ["grant:1"])
-        #expect(FileManager.default.contents(atPath: tokenURL.path) == Data("1".utf8))
-        // A new launch starts from the stored token: the pulled event is not delivered again.
-        let relaunched = PaywallCloudSync(database: database, keychain: nil, minimumPullInterval: 0, tokenURL: tokenURL)
-        #expect(try await relaunched.pull().isEmpty)
+        let first = try #require(try await carrier.pull(since: nil))
+        #expect(first.events.map(\.id) == ["grant:1"])
+        #expect(first.cursor == Data("1".utf8) && first.accountAvailable)
+        #expect(!FileManager.default.fileExists(atPath: tokenURL.path), "the legacy token file is gone")
+        // Another carrier (a new launch) pulling from that cursor gets nothing; from nil, everything.
+        let relaunched = PaywallCloudSync(database: database, keychain: nil, minimumPullInterval: 0)
+        #expect(try await relaunched.pull(since: first.cursor)?.events.isEmpty == true)
+        #expect(try await relaunched.pull(since: nil)?.events.map(\.id) == ["grant:1"])
+        #expect(try await relaunched.pull().map(\.id) == ["grant:1"])
     }
 }

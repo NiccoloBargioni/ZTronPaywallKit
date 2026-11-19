@@ -26,21 +26,60 @@ private final class TerminateAt: DrawObserver {
 
 /// Holds the engine a sink shuts down from inside the audit repair.
 @MainActor
-private final class EngineBox {
+final class EngineBox {
     var engine: GateEngine?
 }
 
 /// A repairing sink that shuts the engine down while the repair waits on it, as a facade replacing its engine
-/// mid-start would.
+/// mid-start would. The repair reads the chain's end from every launch, so that is where the shutdown goes.
 private actor ShuttingDownSink: PaywallAuditRepairing {
     let box: EngineBox
     init(_ box: EngineBox) { self.box = box }
     func write(_ record: AuditRecord) async {}
-    func recordedDebitIDs() async -> Set<String> {
+    func recordedDebitIDs() async -> Set<String> { [] }
+    func lastRecordHash() async -> String? {
         await box.engine?.shutdown()
+        return nil
+    }
+}
+
+/// Shuts the engine down from inside the candidate lookup, or from inside a write during the flush that precedes a
+/// checkpoint.
+actor ShuttingDownLaterSink: PaywallAuditRepairing {
+    enum When: Sendable { case candidateLookup, write }
+    let box: EngineBox
+    let when: When
+    init(_ box: EngineBox, when: When) {
+        self.box = box
+        self.when = when
+    }
+    func write(_ record: AuditRecord) async { if when == .write { await box.engine?.shutdown() } }
+    func recordedDebitIDs() async -> Set<String> { [] }
+    func recordedDebitIDs(among candidates: Set<String>) async -> Set<String> {
+        if when == .candidateLookup { await box.engine?.shutdown() }
         return []
     }
     func lastRecordHash() async -> String? { nil }
+    func retainedSince() async -> Date? { nil }
+}
+
+/// Wraps a `JournalSink` and counts how often the repair asks it for debits, the full set or among candidates.
+private actor CountingRepairSink: PaywallAuditRepairing {
+    let inner: JournalSink
+    private(set) var fullScans = 0
+    private(set) var candidateLookups = 0
+    init(_ inner: JournalSink) { self.inner = inner }
+    func write(_ record: AuditRecord) async { await inner.write(record) }
+    func recordedDebitIDs() async -> Set<String> {
+        fullScans += 1
+        return await inner.recordedDebitIDs()
+    }
+    func recordedDebitIDs(among candidates: Set<String>) async -> Set<String> {
+        candidateLookups += 1
+        return await inner.recordedDebitIDs(among: candidates)
+    }
+    func lastRecordHash() async -> String? { await inner.lastRecordHash() }
+    func retainedSince() async -> Date? { await inner.retainedSince() }
 }
 
 private func isRepair(_ event: PaywallEvent) -> Bool {
@@ -102,17 +141,23 @@ struct RetentionTests {
         #expect(h.engine.journal.pendingUpload.count == 2)
         let relaunched = try await h.relaunch()
         #expect(relaunched.journal.checkpoint?.eventCount == 2)
-        #expect(relaunched.journal.entries.count == 3, "the checkpoint, then the two unacknowledged events")
+        // A9: the two unacknowledged events the checkpoint counts wait in the outbox file, not in the log.
+        #expect(relaunched.journal.entries.count == 2, "the checkpoint and the launch pull's cursor; the outbox is in its own file")
+        #expect(relaunched.journal.ledgerEvents.isEmpty)
+        #expect(relaunched.journal.outboxEvents().count == 2)
         #expect(relaunched.journal.pendingUpload.count == 2)
         #expect(relaunched.wallet.balance == 9)
         await cloud.setReachable(true)
         await relaunched.syncNow()
         #expect(await cloud.events.count == 2)
-        #expect(relaunched.journal.pendingUpload.isEmpty && relaunched.journal.uploadMarkerCount == 1)
-        // The marker compaction at the next open drops the acknowledged outbox; the checkpoint stays in front.
+        #expect(relaunched.journal.pendingUpload.isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: relaunched.journal.outboxURL.path), "acknowledged: the outbox file is pruned away")
+        // The pull after the push wrote the carrier's cursor next to the checkpoint; the next open compacts past the
+        // threshold of 0 and keeps both.
         let next = try await h.relaunch()
         #expect(next.journal.compactedOnOpen)
-        #expect(next.journal.entries.count == 1)
+        #expect(next.journal.entries.count == 2, "the checkpoint and the cursor")
+        #expect(next.journal.cursor != nil)
         #expect(next.ledger.events.isEmpty && next.wallet.balance == 9)
         #expect(next.ledger.contains(try #require(await cloud.events.keys.first)))
     }
@@ -124,7 +169,8 @@ struct RetentionTests {
         let grant = try #require(h.engine.ledger.lastEventID)
         #expect(await eventually { await sync.snapshot?.lastEventID == grant })
         let relaunched = try await h.relaunch()
-        #expect(relaunched.journal.entries.count == 1, "acknowledged and covered: only the checkpoint remains")
+        #expect(relaunched.journal.entries.count == 2, "acknowledged and covered: the checkpoint and the carrier's cursor remain")
+        #expect(relaunched.journal.ledgerEvents.isEmpty)
         await sync.saveSnapshot(WalletSnapshot(accountKey: h.engine.accountKey, balance: 0, lastEventID: "stale", headHash: "h"))
         let again = try await h.relaunch()
         #expect(again.ledger.events.isEmpty && again.ledger.lastEventID == grant)
@@ -166,17 +212,51 @@ struct RetentionTests {
         #expect(!h.events.contains(where: isRepair))
     }
 
+    /// A5: an engine shut down while `start()` waits on the audit repair writes no checkpoint, starts no listener,
+    /// resolves nothing, grants nothing, and writes no snapshot file.
     @Test func no_checkpoint_is_written_once_the_engine_is_shut_down() async throws {
         let h = try await Harness.free(tokens: 10, settings: settings(threshold: 0))
         h.engine.shutdown()
         let box = EngineBox()
+        let directory = makeTemporaryPaywallDirectory()
+        var settings = h.settings
+        settings.welcomeTokens = 100
         let engine = try GateEngine(
-            directory: h.directory, catalog: catalog, settings: h.settings, clock: h.clock, store: h.store,
+            directory: directory, catalog: catalog, settings: settings, clock: h.clock, store: h.store,
             audit: [ShuttingDownSink(box)])
         box.engine = engine
         await engine.start()
         #expect(engine.isShutDown)
         #expect(engine.journal.checkpoint == nil)
+        #expect(engine.updatesTask == nil && engine.intentsTask == nil)
+        #expect(await h.store.listenerCount == 0)
+        #expect(await h.store.intentListenerCount == 0)
+        #expect(engine.entitlement == .unknown)
+        let journal = try Journal(directory: directory)
+        #expect(journal.checkpoint == nil && journal.ledgerEvents.isEmpty, "no welcome grant after shutdown")
+        #expect(!FileManager.default.fileExists(atPath: directory.appendingPathComponent("entitlement.json").path))
+        // The original directory is untouched too.
+        #expect(try Journal(directory: h.directory).checkpoint == nil)
+    }
+
+    /// A5: a shutdown while the repair waits on a sink's candidate lookup repairs nothing; one while the audit flush
+    /// before the checkpoint runs writes no checkpoint.
+    @Test(arguments: [ShuttingDownLaterSink.When.candidateLookup, .write])
+    func a_shutdown_inside_the_repair_or_the_flush_writes_nothing(when: ShuttingDownLaterSink.When) async throws {
+        let h = try await Harness.free(tokens: 10, settings: settings(threshold: 0))
+        _ = h.engine.run(.tokens(1), source: source("g")) {}  // a debit no sink has a record of: a repair candidate
+        h.engine.shutdown()
+        let box = EngineBox()
+        let engine = try GateEngine(
+            directory: h.directory, catalog: catalog, settings: h.settings, clock: h.clock, store: h.store,
+            audit: [ShuttingDownLaterSink(box, when: when)], fileKeyStore: h.fileKeyStore)
+        box.engine = engine
+        var events: [PaywallEvent] = []
+        engine.onEvent = { events.append($0) }
+        await engine.start()
+        #expect(engine.isShutDown, "\(when)")
+        #expect(engine.journal.checkpoint == nil, "\(when)")
+        if when == .candidateLookup { #expect(!events.contains(where: isRepair)) } else { #expect(events.contains(where: isRepair)) }
         #expect(try Journal(directory: h.directory).checkpoint == nil)
     }
 
@@ -199,22 +279,109 @@ struct RetentionTests {
         await h.engine.syncNow()
         #expect(await eventually { await sync.snapshot?.balance == 7 })
         let relaunched = try await h.relaunch()
-        #expect(relaunched.journal.entries.count == 1)
+        #expect(relaunched.journal.entries.count == 2, "the checkpoint and the carrier's cursor")
+        let oldDevice = relaunched.deviceID
         relaunched.shutdown()
         let url = h.directory.appendingPathComponent(Journal.fileName)
         var bytes = [UInt8](try Data(contentsOf: url))
-        bytes[bytes.count / 2] ^= 0xFF
+        bytes[12] ^= 0xFF  // inside the checkpoint, the first frame
         try Data(bytes).write(to: url)
-        // The checkpoint no longer decodes: the log is empty, as after a reinstall. The Keychain snapshot stands in
-        // until the carrier answers, and the pull brings the history back.
+        // The checkpoint no longer decodes: the log is empty, as after a reinstall, and the carrier's cursor went with
+        // it. The Keychain snapshot stands in until the carrier answers, and the pull, from the beginning, brings the
+        // history back. The device stream starts over, so nothing written meanwhile forks the old one.
         await sync.cloud.setReachable(false)
         let recovered = try await h.relaunch()
         #expect(recovered.journal.droppedTailBytes == bytes.count && recovered.ledger.events.isEmpty)
+        #expect(recovered.journal.droppedCorruptFrame && recovered.journal.cursor == nil)
+        #expect(recovered.deviceID != oldDevice)
         #expect(recovered.baseline != nil && recovered.wallet.balance == 7)
         await sync.cloud.setReachable(true)
         await recovered.syncNow()
         #expect(recovered.baseline == nil && recovered.wallet.balance == 7)
         #expect(recovered.ledger.events.count == 2)
+        #expect(recovered.ledger.firstBrokenLink() == nil)
+    }
+
+    // MARK: Audit repair (A12)
+
+    /// A launch with no debit to check never decodes the retained audit files: the repair reads the chain's end and
+    /// the retention floor, finds no candidate, and asks the sink for nothing.
+    @Test func a_launch_with_no_debit_to_check_does_not_scan_the_audit() async throws {
+        let dir = makeTemporaryPaywallDirectory()
+        let clock = FakeClock()
+        let store = FakeStore(products: products)
+        let plain = JournalSink(directory: dir)
+        let first = try GateEngine(directory: dir, catalog: catalog, clock: clock, store: store, audit: [plain])
+        await first.start()
+        first.grant(tokens: 5, reason: "t")
+        _ = first.run(.free, source: source("f")) {}
+        await first.flushAudit()
+        first.shutdown()
+
+        let counting = CountingRepairSink(JournalSink(directory: dir))
+        var repaired = 0
+        let second = try GateEngine(directory: dir, catalog: catalog, clock: clock, store: store, audit: [counting])
+        second.onEvent = { if case .auditRepaired = $0 { repaired += 1 } }
+        await second.start()
+        _ = second.run(.free, source: source("g")) {}
+        await second.flushAudit()
+        #expect(await counting.fullScans == 0)
+        #expect(await counting.candidateLookups == 0)
+        #expect(repaired == 0)
+        let sink = JournalSink(directory: dir)
+        #expect(AuditRecord.firstBrokenLink(in: await sink.records(), after: await sink.chainAnchor()) == nil)
+        second.shutdown()
+
+        // Every debit below the retention floor: rotated out, nothing to check either.
+        let rotated = makeTemporaryPaywallDirectory()
+        let small = JournalSink(directory: rotated, maxBytes: 4_000, maxFiles: 2)
+        let drawer = try GateEngine(directory: rotated, catalog: catalog, clock: clock, store: store, audit: [small])
+        await drawer.start()
+        drawer.grant(tokens: 100, reason: "t")
+        for i in 0..<3 {
+            clock.advance(by: 1)
+            _ = drawer.run(.tokens(1), source: source("d\(i)")) {}
+        }
+        for i in 0..<40 {
+            clock.advance(by: 1)
+            _ = drawer.run(.free, source: source("f\(i)")) {}
+        }
+        await drawer.flushAudit()
+        drawer.shutdown()
+        #expect(await small.retainedSince() != nil)
+        let countingRotated = CountingRepairSink(JournalSink(directory: rotated, maxBytes: 4_000, maxFiles: 2))
+        let later = try GateEngine(directory: rotated, catalog: catalog, clock: clock, store: store, audit: [countingRotated])
+        later.onEvent = { if case .auditRepaired = $0 { repaired += 1 } }
+        await later.start()
+        #expect(await countingRotated.fullScans == 0)
+        #expect(await countingRotated.candidateLookups == 0)
+        #expect(repaired == 0)
+        later.shutdown()
+    }
+
+    /// The candidate lookup decodes only the lines that can carry a debit and equals the full decode intersected.
+    @Test func the_candidate_lookup_matches_a_full_decode() async throws {
+        let dir = makeTemporaryPaywallDirectory()
+        let sink = JournalSink(directory: dir, maxBytes: 600, maxFiles: 4)
+        let oldest = auditRecord(at: t0, event: .tokensConsumed(n: 1, source: source("g"), debitID: "debit:old", leaseUntil: t0))
+        await sink.write(oldest)
+        for i in 0..<6 { await sink.write(auditRecord(at: t0.addingTimeInterval(Double(i)), balance: i)) }
+        await sink.write(auditRecord(at: t0, event: .tokensRefunded(debitID: "debit:refunded", reason: .bodyThrew("x"))))
+        await sink.write(auditRecord(at: t0, event: .auditRepaired(debitID: "debit:repaired")))
+        // A record that mentions the key in its source, not in a debit position.
+        await sink.write(auditRecord(at: t0, event: .gateOpened(source: PaywallSource(id: "\"debitID\"", fileID: "f", function: "g", line: 1), level: .free, mode: .free)))
+        let handle = try FileHandle(forWritingTo: dir.appendingPathComponent(JournalSink.fileName))
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("{\"torn\":\"debitID\"\n".utf8))
+        try handle.close()
+        #expect(await sink.fileURLs().filter { $0.pathExtension == "jsonl" }.count > 1, "rotated")
+        let candidates: Set<String> = ["debit:old", "debit:refunded", "debit:repaired", "debit:never", "\"debitID\""]
+        let full = await sink.recordedDebitIDs()
+        let lookup = await sink.recordedDebitIDs(among: candidates)
+        #expect(lookup == full.intersection(candidates))
+        #expect(lookup.isSuperset(of: ["debit:refunded", "debit:repaired"]))
+        #expect(!lookup.contains("debit:never") && !lookup.contains("\"debitID\""))
+        #expect(await sink.recordedDebitIDs(among: []).isEmpty)
     }
 
     // MARK: Journal

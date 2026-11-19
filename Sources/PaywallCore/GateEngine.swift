@@ -162,6 +162,9 @@ public final class GateEngine {
     /// Signs promotional offers for `purchase(productID:offer:source:)`. `nil`: an offer purchase fails before the store.
     public let promotionalOfferSigner: (any PromotionalOfferSigner)?
     public let sync: (any LedgerSync)?
+    /// Authenticates the caches next to the journal (`app-transaction.json`, `entitlement.json`); `nil` leaves them
+    /// plain and trusted, as a core-only host may choose. The facade installs the Keychain store.
+    public let fileKeyStore: (any PaywallFileKeyStore)?
     public let deviceID: String
     public let sessionID = UUID()
     let logger: Logger
@@ -181,13 +184,25 @@ public final class GateEngine {
     public let leases = LeaseTable()
     public let reservations = ReservationTable()
     var sessions: [UUID: Session] = [:]
-    /// The Keychain snapshot standing in for history this install has not seen. Adopted in `start()` over a ledger
-    /// with no events for its account only; dropped by `settleBaseline`.
+    /// The Keychain snapshot standing in for history this install has not seen: adopted in `start()` over a ledger
+    /// with no events for its account, written to the journal so it outlives the launch, and settled by `merge` once
+    /// the carrier delivers history for its account (see HANDBOOK.md, "Reinstall and the Keychain snapshot").
     var baseline: WalletSnapshot?
     let journal: Journal
     let audit: AuditTrail
     let resolver: EntitlementResolver
     private var reevaluating = false
+    /// Stamps resolutions in the order they start; only a resolution newer than the last applied one is applied, so
+    /// a read that stalled on the App Store cannot undo a purchase or a refund resolved meanwhile.
+    var resolutionGeneration = 0
+    var lastAppliedGeneration = 0
+    /// Token packs the store delivered whose credit the journal could not write: left unfinished, retried at every
+    /// resolution and finished once the credit lands. StoreKit delivers them again at the next launch either way.
+    var unfinishedPacks: [StoreTransaction] = []
+    var retryingUnfinished = false
+    /// Whether the last pull said the carrier has an account to upload to. `false` stops the outbox from being
+    /// encoded and pushed at every sync while a device has no iCloud account; the next pull that finds one pushes.
+    var carrierHasAccount = true
     /// This device's debits in the journal at open, with their dates: the candidates for the audit repair.
     private let debitsAtLaunch: [String: Date]
     private let repairingSinks: [any PaywallAuditRepairing]
@@ -219,6 +234,11 @@ public final class GateEngine {
     public var onEvent: ((PaywallEvent) -> Void)?
     /// The entitlement or the wallet changed.
     public var onStateChange: (() -> Void)?
+    /// A purchase that completed after `shutdown()` (the facade reconfigured while the payment sheet was up). This
+    /// engine credits and finishes nothing after shutdown; the facade hands the transaction to its current engine's
+    /// `adoptPurchase(_:source:)` and answers whether that engine finished it. `nil` leaves it unfinished for the next
+    /// launch's `Transaction.updates`.
+    public var onOrphanedPurchase: ((StoreTransaction, PaywallSource?) async -> Bool)?
     /// Test hook for the crash-safety proof. `nil` in production.
     public var drawObserver: (any DrawObserver)?
     /// Set once a `DrawObserver` terminated a draw: the engine behaves like a dead process from then on.
@@ -237,6 +257,7 @@ public final class GateEngine {
         sync: (any LedgerSync)? = nil,
         connectivity: (any PaywallConnectivity)? = nil,
         audit sinks: [any PaywallAuditSink] = [],
+        fileKeyStore: (any PaywallFileKeyStore)? = nil,
         logger: Logger = Logger(label: "ztron.paywall")
     ) throws(JournalError) {
         self.connectivity = connectivity
@@ -248,17 +269,22 @@ public final class GateEngine {
         self.store = store
         self.promotionalOfferSigner = promotionalOfferSigner
         self.sync = sync
+        self.fileKeyStore = fileKeyStore
         self.logger = logger
         self.resolver = EntitlementResolver(catalog: catalog, grandfathering: grandfathering, familySharing: settings.familySharing)
         let journal = try Journal(
             directory: directory, compactionThreshold: settings.compactionThreshold, fullSync: settings.fullSync)
         self.journal = journal
         self.ledger = Ledger(checkpoint: journal.checkpoint, events: journal.ledgerEvents)
-        let files = PaywallFiles(directory: directory)
-        self.deviceID = files.deviceID()
-        self.accountKey = files.accountKey() ?? unboundAccountKey
+        let files = PaywallFiles(directory: directory, keyStore: fileKeyStore)
+        // A corrupt frame took events the carrier may bring back: a new device stream, so nothing written meanwhile
+        // forks the old one when they do.
+        self.deviceID = journal.droppedCorruptFrame ? files.rotateDeviceID() : files.deviceID()
         let cachedApp = files.appTransaction()
         self.appTransaction = cachedApp
+        // The account partition comes from the authenticated snapshot, not from a file of its own.
+        self.accountKey = cachedApp?.accountKey ?? unboundAccountKey
+        files.removeLegacyAccountKey()
         self.storefront = files.storefront()
         self.entitlement = files.entitlementSnapshot(now: clock.now, familySharing: settings.familySharing) ?? .unknown
         self.repairingSinks = sinks.compactMap { $0 as? any PaywallAuditRepairing }
@@ -269,9 +295,13 @@ public final class GateEngine {
         }
         self.debitsAtLaunch = debits
         if ledger.events.count > settings.compactionThreshold { checkpointCandidate = ledger }
+        // Before the recompute: the balance it persists must count the baseline the journal still holds.
+        self.baseline = journal.baseline
         recomputeLeasesAndWallet(notify: false)
         if journal.droppedTailBytes > 0 {
-            logger.warning("journal: dropped a torn tail", metadata: ["bytes": "\(journal.droppedTailBytes)"])
+            logger.warning(
+                journal.droppedCorruptFrame ? "journal: dropped a corrupt frame and what followed it" : "journal: dropped a torn tail",
+                metadata: ["bytes": "\(journal.droppedTailBytes)"])
         }
         if journal.compactedOnOpen {
             logger.info("journal: compacted at open", metadata: ["entries": "\(journal.entries.count)"])
@@ -283,19 +313,34 @@ public final class GateEngine {
     /// storefront when the last one is stale. Never prompts: no receipt refresh, no `AppStore.sync()`.
     public func start() async {
         guard !isTerminated, !isShutDown else { return }
+        // Each engine's first pull is a real look: a carrier inherited from a predecessor may still be inside its
+        // pull interval, and an answer it did not fetch must not settle this engine's baseline or welcome grant.
+        await sync?.requestPull()
+        guard !isShutDown else { return }
         await repairAudit()
+        guard !isShutDown else { return }
         await writeCheckpointIfDue()
-        if let sync, let snapshot = await sync.loadSnapshot(), !ledger.hasEvents(for: snapshot.accountKey) {
-            // Adopted over a ledger with no history for its account only (a reinstall, a new device). A ledger with
-            // history cannot tell which part of it the snapshot already counts: another device's snapshot from iCloud
-            // Keychain, or this device's own written ahead of a torn journal, would add that history twice.
-            baseline = snapshot
+        guard !isShutDown else { return }
+        if baseline == nil, let sync {
+            let snapshot = await sync.loadSnapshot()
+            guard !isShutDown else { return }
+            if let snapshot, Self.standsForHistory(snapshot), !ledger.hasEvents(for: snapshot.accountKey) {
+                // Adopted over a ledger with no history for its account only (a reinstall, a new device). A ledger
+                // with history cannot tell which part of it the snapshot already counts: another device's snapshot
+                // from iCloud Keychain, or this device's own written ahead of a torn journal, would add that history
+                // twice. Written to the journal, so it stands at the next launch too.
+                adoptBaseline(snapshot)
+            }
         }
         recomputeLeasesAndWallet(notify: true)
         await startUpdatesListener()
+        guard !isShutDown else { return }
         await startPurchaseIntentsListener()
+        guard !isShutDown else { return }
         await startConnectivityListener()
+        guard !isShutDown else { return }
         await refresh(cause: .launch)
+        guard !isShutDown else { return }
         // Without a carrier nothing else can know this account: the welcome grant is written now. With one it
         // waits for the first pull (`performSync`), so a new device of an existing account takes the account's grant.
         if sync == nil { grantWelcomeIfNew() }
@@ -303,7 +348,26 @@ public final class GateEngine {
         await refreshStorefrontIfStale()
     }
 
-    /// Cancels every task the engine owns and stops it from starting more.
+    /// A snapshot that says something: a balance, or a last event. `{0, nil}` is what an install with no history
+    /// writes and is adopted as nothing, so the welcome grant still fires.
+    static func standsForHistory(_ snapshot: WalletSnapshot) -> Bool {
+        snapshot.balance != 0 || snapshot.lastEventID != nil
+    }
+
+    func adoptBaseline(_ snapshot: WalletSnapshot) {
+        do {
+            try journal.append(.baseline(snapshot))
+        } catch {
+            logger.error("journal: baseline write failed", metadata: ["error": "\(error)"])
+        }
+        // Adopted in memory even when the write failed: the balance is right for this launch, and the next launch
+        // adopts the Keychain item again.
+        baseline = snapshot
+    }
+
+    /// Stops the engine for good: every task it owns is cancelled, the journal is closed, the view sessions are
+    /// dropped, and nothing durable happens afterwards (no journal or file write, no audit record, no `finish()`, no
+    /// listener): a successor engine may own the directory by then. Work already in flight returns without effect.
     public func shutdown() {
         isShutDown = true
         updatesTask?.cancel()
@@ -320,6 +384,8 @@ public final class GateEngine {
         intentsTask = nil
         expiryTask = nil
         syncTask = nil
+        sessions.removeAll()
+        journal.close()
     }
 
     /// Waits until every audit record so far reached every sink.
@@ -334,7 +400,8 @@ public final class GateEngine {
 
     /// The pure decision. `excluding` leaves one holder's own reservation out of `reserved`.
     func decide(_ level: GateLevel, gateID: String, excluding holder: UUID? = nil) -> Decision {
-        if isTerminated { return .closed(.storageUnavailable) }
+        // A dead engine (terminated by the crash proof, or shut down and replaced) can make nothing durable.
+        if isTerminated || isShutDown { return .closed(.storageUnavailable) }
         let cost: Int
         switch level {
         case .free:
@@ -346,7 +413,8 @@ public final class GateEngine {
         }
         if entitlement.isPaying { return .open(.paying) }
         if entitlement == .unknown { return .closed(.entitlementUnavailable) }
-        // `.tokens(0)` is rejected at configuration time; at run time it fails closed like `.paid`.
+        // Nothing rejects `.tokens(n)` with n <= 0 up front (gate levels are call-site arguments): at run time it fails
+        // closed like `.paid`, and a debug build logs the call site once (`warnIfInvalid`).
         guard cost > 0 else { return .closed(.requiresPaid) }
         if leases.isActive(gateID, now: clock.now) { return .open(.leased) }
         let own = holder.flatMap { reservations.reservation(of: $0) }.map(\.tokens) ?? 0
@@ -362,8 +430,23 @@ public final class GateEngine {
         }
     }
 
+    #if DEBUG
+        private var warnedInvalidGates: Set<String> = []
+    #endif
+
+    /// Debug builds: a `.tokens(n)` gate with n <= 0 is a caller error that fails closed like `.paid`, logged once per
+    /// gate so the developer learns of it before a free user does.
+    func warnIfInvalid(_ level: GateLevel, _ source: PaywallSource) {
+        #if DEBUG
+            guard !level.isValid, warnedInvalidGates.insert(source.id).inserted else { return }
+            logger.warning(
+                "gate: a token cost of \(level.tokenCost) is not a free gate, it fails closed like .paid", metadata: ["gate": "\(source.id)"])
+        #endif
+    }
+
     /// Logs and publishes, never draws or holds. The routing gate's pre-navigation check.
     public func evaluate(_ level: GateLevel, source: PaywallSource, scope: String? = nil) -> PaywallOutcome<Void> {
+        warnIfInvalid(level, source)
         reportExpiredLease(source.id)
         switch decide(level, gateID: source.id) {
         case .open(let mode):
@@ -400,6 +483,7 @@ public final class GateEngine {
         scope: String? = nil,
         onChange: ((GateSessionState) -> Void)? = nil
     ) -> GateSessionState {
+        warnIfInvalid(level, source)
         sessions[holder] = Session(level: level, policy: policy, source: source, scope: scope, onChange: onChange)
         let state = evaluateSession(holder)
         reevaluateSessions(except: holder)
@@ -549,17 +633,24 @@ public final class GateEngine {
     }
 
     /// Appends one ledger event write-ahead. Used outside the draw path (credits, refunds, grants, extensions).
+    /// `nil` when the event is already there, the engine is dead, or the write failed; a failed sync after a
+    /// successful write is a landed event, as on the draw path (the frame is in the file).
     @discardableResult
     func appendLedger(id: String, kind: LedgerEvent.Kind, source: PaywallSource? = nil) -> LedgerEvent? {
-        guard !isTerminated, !ledger.contains(id) else { return nil }
+        guard !isTerminated, !isShutDown, !ledger.contains(id) else { return nil }
         let event = LedgerEvent(
             id: id, at: clock.now, deviceID: deviceID, accountKey: accountKey, source: source,
             previousHash: ledger.head(for: deviceID), kind: kind)
         do {
-            try journal.append(.event(event, uploaded: false))
+            try journal.write(.event(event, uploaded: false))
         } catch {
             logger.error("journal: append failed", metadata: ["id": "\(id)", "error": "\(error)"])
             return nil
+        }
+        do {
+            try journal.sync()
+        } catch {
+            logger.warning("journal: sync failed after an append", metadata: ["id": "\(id)", "error": "\(error)"])
         }
         ledger.append(event)
         recomputeLeasesAndWallet(notify: true)
@@ -598,7 +689,8 @@ public final class GateEngine {
     // MARK: Events and audit
 
     func emit(_ event: PaywallEvent, entitlementBefore: Entitlement? = nil, balanceBefore: Int? = nil) {
-        guard !isTerminated else { return }
+        // After `shutdown()` the audit files belong to the successor: a late record would break its chain.
+        guard !isTerminated, !isShutDown else { return }
         let now = clock.now
         let uptime = clock.uptime
         let environment = settings.environmentLabel ?? appTransaction?.environment.rawValue ?? "unknown"
@@ -619,15 +711,15 @@ public final class GateEngine {
 
     /// Rebuilds `tokensConsumed` records the audit log lost to a crash between delivery and the audit write. A
     /// debit older than what every sink still retains is left alone: its record may simply have been rotated out,
-    /// and repairing it at every launch would fill the log with repairs of repairs.
+    /// and repairing it at every launch would fill the log with repairs of repairs. The sinks are asked only about
+    /// the debits that remain candidates after that floor, and not at all when none does, so a launch with nothing to
+    /// check never decodes the retained audit files.
     private func repairAudit() async {
         guard !repairingSinks.isEmpty else { return }
-        var recorded: Set<String> = []
         var lastHash: String?
         var retainedSince: Date?
         var someSinkRetainsEverything = false
         for sink in repairingSinks {
-            recorded.formUnion(await sink.recordedDebitIDs())
             if lastHash == nil { lastHash = await sink.lastRecordHash() }
             if let since = await sink.retainedSince() {
                 retainedSince = min(retainedSince ?? since, since)
@@ -637,21 +729,37 @@ public final class GateEngine {
         }
         audit.resume(after: lastHash ?? paywallGenesisHash)
         let floor = someSinkRetainsEverything ? nil : retainedSince
-        for (debitID, at) in debitsAtLaunch.sorted(by: { $0.key < $1.key }) where !recorded.contains(debitID) {
-            // At the floor itself the debit's own records may straddle the dropped file: leave it alone too.
-            if let floor, at <= floor { continue }
+        // At the floor itself the debit's own records may straddle the dropped file: leave it alone too.
+        let candidates = Set(debitsAtLaunch.filter { debit in floor.map { debit.value > $0 } ?? true }.keys)
+        guard !candidates.isEmpty, !isShutDown else { return }
+        var recorded: Set<String> = []
+        for sink in repairingSinks {
+            recorded.formUnion(await sink.recordedDebitIDs(among: candidates))
+        }
+        guard !isShutDown else { return }
+        for debitID in candidates.subtracting(recorded).sorted() {
             emit(.auditRepaired(debitID: debitID))
         }
     }
 
     /// Retention (HANDBOOK.md): once more events than `compactionThreshold` followed the last checkpoint at open, the
-    /// ledger as it stood at open becomes the new checkpoint and the journal drops the events it covers, except the
-    /// outbox. Only what an earlier process wrote is covered, and only after this launch's audit repair saw it in the
-    /// journal and the flush put every repaired record in the sinks' hands: a debit written since open stays in the
-    /// log for the next launch's repair. Nothing is written to the journal after `shutdown()`, since a successor
-    /// engine may own the file by then.
+    /// ledger as it stood at open becomes the new checkpoint and the journal drops the events it covers; the ones the
+    /// carrier has not acknowledged move to the outbox file. Only what an earlier process wrote is covered, and only
+    /// after this launch's audit repair saw it in the journal and the flush put every repaired record in the sinks'
+    /// hands: a debit written since open stays in the log for the next launch's repair. Nothing is written to the
+    /// journal after `shutdown()`, since a successor engine may own the file by then. A log in the shape earlier builds
+    /// wrote, with covered unacknowledged events behind its checkpoint, is compacted once to move them out.
     private func writeCheckpointIfDue() async {
-        guard let candidate = checkpointCandidate else { return }
+        guard let candidate = checkpointCandidate else {
+            guard sync != nil, journal.hasCoveredOutboxInLog, !isTerminated, !isShutDown else { return }
+            do {
+                try journal.compact()
+                logger.info("journal: moved the covered outbox out of the log", metadata: ["entries": "\(journal.entries.count)"])
+            } catch {
+                logger.error("journal: outbox migration failed", metadata: ["error": "\(error)"])
+            }
+            return
+        }
         checkpointCandidate = nil
         await flushAudit()
         guard !isTerminated, !isShutDown else { return }
@@ -698,9 +806,23 @@ public final class GateEngine {
     }
 }
 
-/// Small files next to the journal: device id, account key, and the caches resolution falls back on offline.
+/// Small files next to the journal: the device id, the storefront cache, and the two caches resolution falls back
+/// on offline, `app-transaction.json` and `entitlement.json`, which can open paid gates on their own.
+///
+/// With a key store those two are authenticated: each is written as `{"mac": <hex>, "payload": <base64 JSON>}`, the
+/// tag an HMAC-SHA256 over the payload bytes under a key that never leaves the install, and a file whose tag is
+/// missing or wrong is dropped on read (never re-tagged: a file written before the key existed, or planted, is not
+/// laundered), so an edited container or a restored backup plants nothing. With no key at hand (the Keychain before
+/// first unlock) nothing is written or trusted. Without a key store the files are plain JSON and trusted as written,
+/// the shape every build before this one wrote.
 struct PaywallFiles {
     let directory: URL
+    let keyStore: (any PaywallFileKeyStore)?
+
+    init(directory: URL, keyStore: (any PaywallFileKeyStore)? = nil) {
+        self.directory = directory
+        self.keyStore = keyStore
+    }
 
     private func url(_ name: String) -> URL { directory.appendingPathComponent(name) }
 
@@ -710,57 +832,85 @@ struct PaywallFiles {
         {
             return id
         }
+        return rotateDeviceID()
+    }
+
+    /// A new device id, written over the old one: a new stream for the chain.
+    func rotateDeviceID() -> String {
         let id = UUID().uuidString
         try? Data(id.utf8).write(to: url("device.id"), options: .atomic)
         return id
     }
 
-    func accountKey() -> String? {
-        FileManager.default.contents(atPath: url("account.key").path).flatMap { String(data: $0, encoding: .utf8) }
+    /// Builds before this one cached the account key in a file of its own; it is derived from the app transaction now.
+    func removeLegacyAccountKey() {
+        try? FileManager.default.removeItem(at: url("account.key"))
     }
 
-    func saveAccountKey(_ key: String) {
-        try? Data(key.utf8).write(to: url("account.key"), options: .atomic)
+    /// The authenticated shape of a cache.
+    struct Envelope: Codable {
+        var mac: String
+        var payload: Data
     }
 
-    private func load<T: Decodable>(_ type: T.Type, _ name: String) -> T? {
-        FileManager.default.contents(atPath: url(name).path).flatMap { try? CanonicalJSON.decoder().decode(type, from: $0) }
+    private func load<T: Decodable>(_ type: T.Type, _ name: String, authenticated: Bool) -> T? {
+        guard let data = FileManager.default.contents(atPath: url(name).path) else { return nil }
+        let decoder = CanonicalJSON.decoder()
+        guard authenticated, let keyStore else { return try? decoder.decode(type, from: data) }
+        guard let key = keyStore.fileKey(), let envelope = try? decoder.decode(Envelope.self, from: data),
+            envelope.mac == Self.tag(envelope.payload, key: key)
+        else { return nil }
+        return try? decoder.decode(type, from: envelope.payload)
     }
 
-    private func save<T: Encodable>(_ value: T, _ name: String) {
-        guard let data = try? CanonicalJSON.encoder().encode(value) else { return }
+    private func save<T: Encodable>(_ value: T, _ name: String, authenticated: Bool) {
+        guard let payload = try? CanonicalJSON.encoder().encode(value) else { return }
+        var data = payload
+        if authenticated, let keyStore {
+            guard let key = keyStore.fileKey(), let enveloped = try? CanonicalJSON.encoder().encode(Envelope(mac: Self.tag(payload, key: key), payload: payload))
+            else { return }
+            data = enveloped
+        }
         try? data.write(to: url(name), options: .atomic)
     }
 
-    func appTransaction() -> AppTransactionSnapshot? { load(AppTransactionSnapshot.self, "app-transaction.json") }
-    func saveAppTransaction(_ snapshot: AppTransactionSnapshot) { save(snapshot, "app-transaction.json") }
+    static func tag(_ payload: Data, key: Data) -> String {
+        HMACSHA256.tag(key: key, message: payload).map { byte in
+            let s = String(byte, radix: 16)
+            return s.count == 1 ? "0" + s : s
+        }.joined()
+    }
+
+    func appTransaction() -> AppTransactionSnapshot? { load(AppTransactionSnapshot.self, "app-transaction.json", authenticated: true) }
+    func saveAppTransaction(_ snapshot: AppTransactionSnapshot) { save(snapshot, "app-transaction.json", authenticated: true) }
 
     struct EntitlementSnapshot: Codable {
         var entitlement: Entitlement
         var resolvedAt: Date
     }
 
-    /// The last successful resolution, with lapsed subscriptions downgraded to free, and family-shared
-    /// entitlements downgraded when the policy no longer admits them.
+    /// The last successful resolution, with lapsed subscriptions downgraded to free (a subscription in its billing
+    /// grace period lapses at the grace end), and family-shared entitlements downgraded when the policy no longer
+    /// admits them.
     func entitlementSnapshot(now: Date, familySharing: FamilySharingPolicy = .sharedEntitlements) -> Entitlement? {
-        guard let snapshot = load(EntitlementSnapshot.self, "entitlement.json") else { return nil }
-        if case .subscribed(let subscription) = snapshot.entitlement, let expiresAt = subscription.expiresAt, expiresAt <= now {
+        guard let snapshot = load(EntitlementSnapshot.self, "entitlement.json", authenticated: true) else { return nil }
+        if case .subscribed(let subscription) = snapshot.entitlement, let endsAt = subscription.accessEndsAt, endsAt <= now {
             return .free
         }
         if familySharing == .purchaserOnly, snapshot.entitlement.isFamilyShared { return .free }
         return snapshot.entitlement == .unknown ? nil : snapshot.entitlement
     }
 
-    func entitlementSnapshotDate() -> Date? { load(EntitlementSnapshot.self, "entitlement.json")?.resolvedAt }
+    func entitlementSnapshotDate() -> Date? { load(EntitlementSnapshot.self, "entitlement.json", authenticated: true)?.resolvedAt }
 
     func saveEntitlementSnapshot(_ entitlement: Entitlement, at date: Date = Date()) {
         guard entitlement != .unknown else { return }
-        save(EntitlementSnapshot(entitlement: entitlement, resolvedAt: date), "entitlement.json")
+        save(EntitlementSnapshot(entitlement: entitlement, resolvedAt: date), "entitlement.json", authenticated: true)
     }
 
     func grandfatherLogged() -> Bool { FileManager.default.fileExists(atPath: url("grandfathered.logged").path) }
     func markGrandfatherLogged() { _ = FileManager.default.createFile(atPath: url("grandfathered.logged").path, contents: Data()) }
 
-    func storefront() -> PaywallStorefront? { load(PaywallStorefront.self, "storefront.json") }
-    func saveStorefront(_ storefront: PaywallStorefront) { save(storefront, "storefront.json") }
+    func storefront() -> PaywallStorefront? { load(PaywallStorefront.self, "storefront.json", authenticated: false) }
+    func saveStorefront(_ storefront: PaywallStorefront) { save(storefront, "storefront.json", authenticated: false) }
 }

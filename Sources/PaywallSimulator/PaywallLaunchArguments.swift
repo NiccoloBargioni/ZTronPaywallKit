@@ -53,10 +53,10 @@
                 }
             }
             for key in PaywallLaunchArgument.allCases {
-                guard key != .preset, let raw = values[key] else { continue }
+                guard let raw = values[key] else { continue }
                 switch key {
                 case .preset:
-                    break
+                    continue  // applied above, before the overrides
                 case .tokens:
                     if let n = Int(raw), n >= 0 { simulation.tokens = n } else { problems.append(.invalidValue(key, raw)) }
                 case .network:

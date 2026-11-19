@@ -1,7 +1,8 @@
 import Foundation
-import PaywallCore
 import PaywallTesting
 import Testing
+
+@testable import PaywallCore
 
 /// The promotional offer path of `purchase`: the engine asks the signer for this install's signature and hands it to
 /// the store, or fails the purchase before the store when it cannot. Nothing here holds a key: the fake signer answers
@@ -110,17 +111,62 @@ struct PromotionalOfferTests {
         let otherProduct = SignedPromotionalOffer(productID: "pro.yearly", offerID: "comeback", compactJWS: "x.y.z")
         let signer = FakePromotionalOfferSigner(next: .answer(otherProduct))
         let h = try await harness(signer: signer)
-        await #expect(throws: PromotionalOfferError.signatureMismatch(received: otherProduct)) {
+        await #expect(throws: PromotionalOfferError.signatureMismatch(productID: "pro.yearly", offerID: "comeback")) {
             _ = try await h.engine.purchase(productID: "pro.monthly", offer: Self.comeback, source: nil)
         }
         let otherOffer = SignedPromotionalOffer(productID: "pro.monthly", offerID: "winter", compactJWS: "x.y.z")
         await signer.setNext(.answer(otherOffer))
-        await #expect(throws: PromotionalOfferError.signatureMismatch(received: otherOffer)) {
+        await #expect(throws: PromotionalOfferError.signatureMismatch(productID: "pro.monthly", offerID: "winter")) {
             _ = try await h.engine.purchase(productID: "pro.monthly", offer: Self.comeback, source: nil)
         }
         #expect(await signer.requests.count == 2)
         #expect(await h.store.purchaseCalls == 0)
         #expect(!h.events.contains(.promotionalOfferSigned(productID: "pro.monthly", offerID: "comeback")))
+    }
+
+    /// B8: the signer's answer for another product never reaches a log. The error names what the signer answered
+    /// for, and neither the error, the events nor the audit records carry the unredeemed signature.
+    @Test func a_mismatched_answer_keeps_the_signature_out_of_the_audit_and_the_error() async throws {
+        let signer = FakePromotionalOfferSigner(
+            next: .answer(SignedPromotionalOffer(productID: "pro.yearly", offerID: "comeback", compactJWS: "h.p.UNREDEEMED-SIG")))
+        let h = try await harness(signer: signer)
+        var thrown: (any Error)?
+        do {
+            _ = try await h.engine.purchase(productID: "pro.monthly", offer: Self.comeback, source: nil)
+        } catch {
+            thrown = error
+        }
+        let error = try #require(thrown)
+        guard case PromotionalOfferError.signatureMismatch(let productID, let offerID) = error else {
+            Issue.record("expected a mismatch, got \(error)")
+            return
+        }
+        #expect(productID == "pro.yearly" && offerID == "comeback")
+        #expect(!String(describing: error).contains("UNREDEEMED-SIG"))
+        #expect(!String(reflecting: error).contains("UNREDEEMED-SIG"))
+        let records = await h.records()
+        for record in records {
+            let encoded = String(decoding: try CanonicalJSON.encoder().encode(record), as: UTF8.self)
+            #expect(!encoded.contains("UNREDEEMED-SIG"))
+        }
+        let failed = h.events.compactMap { event -> String? in
+            if case .purchase(.failed(let text), _, _, _) = event { return text }
+            return nil
+        }
+        #expect(failed.count == 1)
+        #expect(failed.allSatisfy { !$0.contains("UNREDEEMED-SIG") })
+        #expect(await h.store.purchaseCalls == 0)
+    }
+
+    /// B10: an empty app transaction id (what the back-deployed `appTransactionID` reads below iOS 18.4 when the payload
+    /// lacks one) is no id: the signer is never asked to bind the offer to `""`.
+    @Test func an_empty_app_transaction_id_reaches_the_signer_as_none() async throws {
+        let signer = FakePromotionalOfferSigner()
+        var empty = Self.app
+        empty.appTransactionID = ""
+        let h = try await harness(signer: signer, app: empty)
+        _ = try await h.engine.purchase(productID: "pro.monthly", offer: Self.comeback, source: nil)
+        #expect(await signer.requests.map(\.transactionID) == [nil])
     }
 
     @Test func the_bundle_comes_from_the_settings_else_from_the_app_transaction() async throws {

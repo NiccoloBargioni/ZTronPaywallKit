@@ -50,13 +50,114 @@ struct FailurePathTests {
     @Test func merge_failure_keeps_the_ledger_unchanged() async throws {
         let harness = try await Harness.free()
         harness.engine.journal.injectedFault = .write
-        harness.engine.merge([grantEvent("grant:remote")])
+        #expect(!harness.engine.merge([grantEvent("grant:remote")], cursor: Data("1".utf8)))
         #expect(harness.engine.wallet.balance == 0)
+        #expect(harness.engine.journal.cursor == nil, "a failed merge moves no cursor")
         harness.engine.journal.injectedFault = nil
-        harness.engine.merge([grantEvent("grant:remote")])
+        #expect(harness.engine.merge([grantEvent("grant:remote")], cursor: Data("1".utf8)))
         #expect(harness.engine.wallet.balance == 4)
-        harness.engine.merge([grantEvent("grant:remote")])  // already present: no-op
+        #expect(harness.engine.journal.cursor == Data("1".utf8))
+        #expect(harness.engine.merge([grantEvent("grant:remote")]))  // already present: no-op, still a success
         #expect(harness.events.filter { if case .syncMerged = $0 { true } else { false } }.count == 1)
+    }
+
+    // MARK: Credits (A2)
+
+    private func completedPurchases(_ harness: Harness) -> Int {
+        harness.events.filter { if case .purchase(.completed, _, _, _) = $0 { true } else { false } }.count
+    }
+
+    /// A2: a pack whose credit the journal could not write is not finished and not reported as bought; StoreKit
+    /// delivers it again at the next launch and it is credited exactly once.
+    @Test func credit_write_failure_leaves_the_purchase_unfinished() async throws {
+        let h = try await Harness.free()
+        await h.store.setProducts(products)
+        h.engine.journal.injectedFault = .write
+        let outcome = try await h.engine.purchase(productID: "tokens.10", source: source("paywall"))
+        #expect(outcome == .pending)
+        #expect(await h.store.finished.isEmpty)
+        #expect(h.engine.wallet.balance == 0)
+        #expect(completedPurchases(h) == 0)
+        #expect(h.events.contains { if case .purchase(.pending, "tokens.10", _, _) = $0 { true } else { false } })
+        let tx = try #require(await h.store.history.last)
+        h.engine.journal.injectedFault = nil
+        let engine = try await h.relaunch()
+        await h.store.deliver(tx)
+        #expect(await eventually { await h.store.finished == [tx.id] })
+        #expect(engine.wallet.balance == 10)
+        #expect(engine.ledger.events.filter { $0.id == "credit:\(tx.id)" }.count == 1)
+    }
+
+    @Test func credit_write_failure_on_updates_leaves_the_transaction_unfinished() async throws {
+        let h = try await Harness.free()
+        h.engine.journal.injectedFault = .write
+        let tx = StoreTransaction.tokenPack(id: 21, productID: "tokens.10", purchased: h.clock.now)
+        #expect(await !h.engine.handle(tx))
+        #expect(await h.store.finished.isEmpty)
+        #expect(h.engine.wallet.balance == 0)
+        h.engine.journal.injectedFault = nil
+        let engine = try await h.relaunch()
+        await h.store.deliver(tx)
+        #expect(await eventually { await h.store.finished == [21] })
+        #expect(engine.wallet.balance == 10)
+        #expect(engine.ledger.events.filter { $0.id == "credit:21" }.count == 1)
+    }
+
+    /// A poisoned journal (a rewind that failed) refuses every write until a relaunch: the pack stays unfinished too.
+    @Test func a_poisoned_journal_leaves_the_pack_unfinished_until_relaunch() async throws {
+        let h = try await Harness.free(tokens: 1)
+        h.engine.journal.injectedFault = .poison
+        #expect(!h.engine.grant(tokens: 1, reason: "poison"))
+        h.engine.journal.injectedFault = nil
+        #expect(h.engine.journal.isPoisoned)
+        let tx = StoreTransaction.tokenPack(id: 22, productID: "tokens.10", purchased: h.clock.now)
+        #expect(await !h.engine.handle(tx))
+        #expect(await h.store.finished.isEmpty)
+        let engine = try await h.relaunch()
+        #expect(engine.wallet.balance == 1)
+        await h.store.deliver(tx)
+        #expect(await eventually { await h.store.finished == [22] })
+        #expect(engine.wallet.balance == 11)
+        #expect(engine.ledger.events.filter { $0.id == "credit:22" }.count == 1)
+    }
+
+    /// A failed sync after a successful write is a landed credit (the frame is in the file), as on the draw path: the
+    /// pack is finished, and the relaunch agrees.
+    @Test func sync_failure_after_a_credit_still_lands_it() async throws {
+        let h = try await Harness.free()
+        await h.store.setProducts(products)
+        h.engine.journal.injectedFault = .sync
+        let outcome = try await h.engine.purchase(productID: "tokens.10", source: nil)
+        guard case .purchased(let id) = outcome else {
+            Issue.record("expected a purchase, got \(outcome)")
+            return
+        }
+        #expect(h.engine.wallet.balance == 10)
+        #expect(await h.store.finished == [id])
+        h.engine.journal.injectedFault = nil
+        let engine = try await h.relaunch()
+        #expect(engine.wallet.balance == 10)
+        #expect(engine.ledger.events.filter { $0.id == "credit:\(id)" }.count == 1)
+    }
+
+    /// The same session retries: once the journal takes writes again, the next resolution credits and finishes the
+    /// pack without waiting for a relaunch.
+    @Test func an_unfinished_pack_is_credited_at_the_next_resolution_in_the_same_session() async throws {
+        let h = try await Harness.free()
+        await h.store.setProducts(products)
+        h.engine.journal.injectedFault = .write
+        #expect(try await h.engine.purchase(productID: "tokens.10", source: nil) == .pending)
+        let tx = try #require(await h.store.history.last)
+        await h.engine.refresh(cause: .foreground)  // the journal still refuses: the pack keeps waiting
+        #expect(h.engine.wallet.balance == 0)
+        #expect(await h.store.finished.isEmpty)
+        h.engine.journal.injectedFault = nil
+        await h.engine.refresh(cause: .foreground)
+        #expect(h.engine.wallet.balance == 10)
+        #expect(await h.store.finished == [tx.id])
+        await h.engine.refresh(cause: .foreground)
+        #expect(await h.store.finished == [tx.id], "finished once")
+        #expect(h.engine.ledger.events.filter { $0.id == "credit:\(tx.id)" }.count == 1)
     }
 
     @Test func engine_launches_over_a_torn_tail() async throws {
@@ -216,6 +317,10 @@ struct FailurePathTests {
         let snapshot = PaywallFiles.EntitlementSnapshot(entitlement: .unknown, resolvedAt: Date())
         try CanonicalJSON.encoder().encode(snapshot).write(to: directory.appendingPathComponent("entitlement.json"))
         #expect(PaywallFiles(directory: directory).entitlementSnapshot(now: Date()) == nil)
+        // And the engine never writes one: `.unknown` is the absence of a resolution.
+        let fresh = makeTemporaryPaywallDirectory()
+        PaywallFiles(directory: fresh).saveEntitlementSnapshot(.unknown)
+        #expect(!FileManager.default.fileExists(atPath: fresh.appendingPathComponent("entitlement.json").path))
     }
 
     @Test func a_lapsed_subscription_snapshot_launches_as_free() {
@@ -226,6 +331,19 @@ struct FailurePathTests {
         #expect(files.entitlementSnapshot(now: now) == .free)
         files.saveEntitlementSnapshot(.subscription(.monthly, expiresAt: now.addingTimeInterval(60)), at: now)
         #expect(files.entitlementSnapshot(now: now)?.isPaying == true)
+    }
+
+    /// A3: a snapshot taken inside a billing grace period launches as subscribed until the grace end, not until the
+    /// failed renewal date.
+    @Test func a_snapshot_inside_billing_grace_launches_as_subscribed_until_the_grace_ends() {
+        let files = PaywallFiles(directory: makeTemporaryPaywallDirectory())
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let graceEnd = now.addingTimeInterval(10 * 86_400)
+        let inGrace = Entitlement.subscription(.monthly, expiresAt: now.addingTimeInterval(-3_600), phase: .inGracePeriod, gracePeriodEndsAt: graceEnd)
+        files.saveEntitlementSnapshot(inGrace, at: now)
+        #expect(files.entitlementSnapshot(now: now) == inGrace)
+        #expect(files.entitlementSnapshot(now: graceEnd.addingTimeInterval(-1)) == inGrace)
+        #expect(files.entitlementSnapshot(now: graceEnd) == .free)
     }
 
     @Test func audit_sink_with_one_file_rotates_by_truncation() async throws {
@@ -256,11 +374,32 @@ struct SmallSurfaceTests {
         func pull() async throws -> [LedgerEvent] { [] }
     }
 
-    @Test func ledger_sync_defaults_are_inert() async {
+    /// A `StoreClient` that implements only what the protocol requires.
+    private struct BareStore: StoreClient {
+        func currentEntitlements() async throws -> [StoreTransaction] { [] }
+        func allTransactions() async throws -> [StoreTransaction] { [] }
+        func appTransaction() async throws -> AppTransactionSnapshot? { nil }
+        func updates() async -> AsyncStream<StoreTransaction> { AsyncStream { $0.finish() } }
+        func purchaseIntents() async -> AsyncStream<String> { AsyncStream { $0.finish() } }
+        func products(for ids: Set<String>) async throws -> [PaywallProduct] { [] }
+        func purchase(productID: String, offer: SignedPromotionalOffer?) async throws -> StorePurchaseResult { .userCancelled }
+        func sync() async throws {}
+        func finish(transactionID: UInt64) async {}
+        func subscriptionPhase(groupID: String) async throws -> SubscriptionPhase? { nil }
+        func isEligibleForIntroOffer(groupID: String) async -> Bool { false }
+        func storefrontCountryCode() async -> String? { nil }
+    }
+
+    @Test func ledger_sync_defaults_are_inert() async throws {
         let sync = BareSync()
         #expect(await sync.loadSnapshot() == nil)
         await sync.saveSnapshot(WalletSnapshot(accountKey: "k", balance: 1, lastEventID: "e", headHash: "h"))
         await sync.requestPull()
+        // A6: a carrier that forwards only `pull()` pulls everything every time and keeps no position.
+        let pull = try #require(try await sync.pull(since: Data("anywhere".utf8)))
+        #expect(pull.events.isEmpty && pull.cursor == nil && pull.accountAvailable)
+        // A3: a store client without a grace read reports no grace.
+        #expect(try await BareStore().renewalGraceEnd(groupID: "g") == nil)
     }
 
     @Test func system_clock_reads_and_sleeps() async throws {

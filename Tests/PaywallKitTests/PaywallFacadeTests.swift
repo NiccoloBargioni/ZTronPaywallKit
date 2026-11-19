@@ -32,6 +32,7 @@ func makePaywall(
     let clock = FakeClock()
     let store = FakeStore(entitlements: entitlements, products: products, now: { await clock.now })
     var configuration = Paywall.Configuration(catalog: catalog)
+    configuration.fileKeyStore = InMemoryFileKeyStore()
     configuration.welcomeTokens = welcomeTokens
     configuration.store = store
     configuration.clock = clock
@@ -54,6 +55,34 @@ func settle() async {
 @Suite("Facade", .serialized)
 @MainActor
 struct PaywallFacadeTests {
+    /// The model behind `.paywallGated`: one session per holder, opened once, closed once, with no session to read
+    /// before it opened.
+    @Test func a_gate_session_model_opens_and_closes_once() async {
+        let (paywall, _, _) = await makePaywall()
+        let model = GateSessionModel()
+        #expect(model.session == nil)
+        model.close()  // never opened: nothing to close
+        let gate = PaywallSource(id: "map", fileID: "f", function: "g", line: 1)
+        model.open(on: paywall, level: .paid, policy: .reserve, source: gate, scope: nil)
+        #expect(model.session?.isOpen == false && model.state?.failure?.reason == .requiresPaid)
+        model.open(on: paywall, level: .free, policy: .reserve, source: gate, scope: nil)  // a second open is ignored
+        #expect(model.session?.level == .paid)
+        #expect(paywall.liveSessions.count == 1)
+        model.close()
+        model.close()
+        #expect(paywall.liveSessions.isEmpty)
+    }
+
+    /// A presenter entering or leaving a window tells every installed sheet to decide again.
+    @Test func presenter_changes_reach_every_installed_sheet() async {
+        let (paywall, _, _) = await makePaywall()
+        var changes = 0
+        let subscription = paywall.presenterChanges.sink { changes += 1 }
+        paywall.presentersChanged()
+        #expect(changes == 1)
+        subscription.cancel()
+    }
+
     @Test func configure_mirrors_entitlement_and_wallet() async {
         let (paywall, _, _) = await makePaywall(entitlements: [.lifetime(id: 1, productID: "pro.lifetime", purchased: Date())], tokens: 4)
         #expect(paywall.entitlement == .lifetime(.purchase(transactionID: 1)))
@@ -90,6 +119,7 @@ struct PaywallFacadeTests {
     @Test func unwritable_storage_is_reported() {
         let paywall = Paywall()
         var configuration = Paywall.Configuration(catalog: catalog)
+        configuration.fileKeyStore = InMemoryFileKeyStore()
         configuration.storageDirectory = URL(fileURLWithPath: "/dev/null/paywall")
         configuration.store = FakeStore()
         configuration.clock = FakeClock()
@@ -247,6 +277,7 @@ struct PaywallFacadeTests {
         let paywall = Paywall()
         let shared = StoreTransaction.lifetime(id: 5, productID: "pro.lifetime", purchased: Date()).familyShared()
         var configuration = Paywall.Configuration(catalog: catalog)
+        configuration.fileKeyStore = InMemoryFileKeyStore()
         configuration.store = FakeStore(entitlements: [shared], products: products)
         configuration.clock = FakeClock()
         configuration.connectivity = nil
@@ -267,6 +298,7 @@ struct PaywallFacadeTests {
         let (paywall, _, _) = await makePaywall(tokens: 2)
         let first = paywall.engine
         var configuration = Paywall.Configuration(catalog: catalog)
+        configuration.fileKeyStore = InMemoryFileKeyStore()
         configuration.welcomeTokens = 0
         configuration.store = FakeStore()
         configuration.clock = FakeClock()
@@ -304,6 +336,7 @@ struct PaywallFacadeTests {
         #expect(unconfigured.audit == nil && unconfigured.ledger == nil)
         let paywall = Paywall()
         var configuration = Paywall.Configuration(catalog: catalog)
+        configuration.fileKeyStore = InMemoryFileKeyStore()
         let signed = AppTransactionSnapshot(
             bundleID: "b", originalAppVersion: "200", originalPurchaseDate: Date(), environment: .production,
             origin: .appTransaction, signedPayload: Data("jws".utf8))
@@ -390,6 +423,7 @@ struct DisclosureTests {
         @Test func configuration_passes_the_grandfather_override_to_the_engine() async {
             let paywall = Paywall()
             var configuration = Paywall.Configuration(catalog: catalog)
+            configuration.fileKeyStore = InMemoryFileKeyStore()
             configuration.store = FakeStore(products: products)
             configuration.clock = FakeClock()
             configuration.connectivity = nil

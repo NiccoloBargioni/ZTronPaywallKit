@@ -35,6 +35,7 @@ struct StorefrontFacadeTests {
 
         let passthrough = Paywall()
         var configuration = Paywall.Configuration(catalog: catalog)
+        configuration.fileKeyStore = InMemoryFileKeyStore()
         configuration.passthrough = true
         configuration.store = FakeStore(products: products)
         configuration.storageDirectory = makeTemporaryPaywallDirectory()
@@ -53,6 +54,7 @@ struct StorefrontFacadeTests {
     @Test func a_fresh_install_gets_the_default_welcome_tokens_once() async {
         let paywall = Paywall()
         var configuration = Paywall.Configuration(catalog: catalog)
+        configuration.fileKeyStore = InMemoryFileKeyStore()
         #expect(configuration.welcomeTokens == 100)
         configuration.store = FakeStore(products: products)
         configuration.clock = FakeClock()

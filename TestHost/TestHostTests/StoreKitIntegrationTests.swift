@@ -5,8 +5,9 @@ import StoreKit
 import StoreKitTest
 import Testing
 import PaywallCore
-import PaywallKit
 import PaywallTesting
+
+@testable import PaywallKit
 
 /// The `StoreKitIntegrationTests` lane of the design: the production `StoreKit2Client` against `SKTestSession` and
 /// the package's `.storekit` file, inside an app host (StoreKit refuses purchases, `AppTransaction` and simulated
@@ -101,6 +102,11 @@ struct StoreKitIntegrationTests {
         #expect(comeback.id == "comeback" && comeback.paymentMode == .payAsYouGo && comeback.isEligible == nil)
         #expect(comeback.periodDays == 30 && comeback.periodCount == 3 && comeback.price == Decimal(string: "2.99"))
         #expect(products.first { $0.id == "tokens.10" }?.offers.isEmpty == true)
+        // A10: the yearly plan's introductory offer is paid up front: an offer, but no free trial.
+        let yearly = try #require(products.first { $0.id == "pro.yearly" })
+        #expect(yearly.introOffer == nil)
+        let upFront = try #require(yearly.offers.first { $0.kind == .introductory })
+        #expect(upFront.paymentMode == .payUpFront && upFront.price == Decimal(string: "14.99") && upFront.periodDays == 365)
 
         // The launch fetched the storefront; the facade publishes it and the tier.
         let storefront = try #require(Paywall.shared.storefront)
@@ -128,8 +134,9 @@ struct StoreKitIntegrationTests {
         #expect(engine.appTransaction?.bundleID == Bundle.main.bundleIdentifier)
         #expect(engine.accountKey != unboundAccountKey)
         #expect(engine.entitlement == .free)
+        #expect(engine.appTransaction?.appTransactionID != "", "B10: an empty id reads as nil")
         // The StoreKit Testing receipt is signed by Xcode's authority, not Apple's: the receipt path fails closed.
-        #expect(try ReceiptClient().snapshot() == nil)
+        #expect(try await ReceiptClient().snapshot() == nil)
     }
 
     /// The design's criterion: a refund issued outside the app flips a paying user to free within a turn.
@@ -210,6 +217,85 @@ struct StoreKitIntegrationTests {
         await Paywall.shared.refresh()
         #expect(await waitUntil { Paywall.shared.entitlement == .free })
         #expect(log.events.contains { if case .entitlementChanged(.subscribed, .free, _) = $0 { true } else { false } })
+    }
+
+    /// A10: a paid introductory offer (pay up front) is a paying period, not a trial: the tier is the plan's own.
+    @Test func a_paid_introductory_offer_is_not_a_trial() async throws {
+        _ = try await start()
+        #expect(await Paywall.shared.isEligibleForIntroOffer())
+        let yearly = try await product("pro.yearly")
+        let outcome = try await Paywall.shared.purchase(yearly)
+        guard case .purchased(let id) = outcome else { Issue.record("expected a purchase, got \(outcome)"); return }
+        guard case .subscribed(let subscription) = Paywall.shared.entitlement else {
+            Issue.record("expected a subscription, got \(Paywall.shared.entitlement)")
+            return
+        }
+        #expect(subscription.tier == .yearly)
+        #expect(!subscription.isTrial, "pay up front is a paying period")
+        #expect(Paywall.shared.tier == .yearly)
+        if #available(iOS 17.2, *) {
+            var redeemed: (type: Transaction.OfferType?, mode: Transaction.Offer.PaymentMode?)?
+            for await result in Transaction.currentEntitlements {
+                guard case .verified(let transaction) = result, transaction.id == id else { continue }
+                redeemed = (transaction.offer?.type, transaction.offer?.paymentMode)
+            }
+            #expect(redeemed?.type == .introductory && redeemed?.mode == .payUpFront, "StoreKit applied the introductory offer")
+        }
+    }
+
+    @Test func an_unknown_product_cannot_be_bought_and_a_fresh_install_has_no_subscription_phase() async throws {
+        _ = try await start()
+        #expect(try await Paywall.shared.subscriptionPhase() == nil)
+        #expect(try await StoreKit2Client().renewalGraceEnd(groupID: hostCatalog.subscriptionGroupID) == nil, "no subscription: no grace")
+        let ghost = PaywallProduct(id: "ghost.product", kind: .lifetime, displayName: "Ghost", displayPrice: "€0")
+        await #expect(throws: StoreClientError.productNotFound("ghost.product")) { _ = try await Paywall.shared.purchase(ghost) }
+        // A10: the pure trial decision, on the device lane too.
+        #expect(StoreKit2Client.isIntroductoryFreeTrial(offerType: .introductory, paymentModeRawValue: "FREE_TRIAL"))
+        #expect(!StoreKit2Client.isIntroductoryFreeTrial(offerType: .introductory, paymentModeRawValue: "PAY_UP_FRONT"))
+        #expect(!StoreKit2Client.isIntroductoryFreeTrial(offerType: .promotional, paymentModeRawValue: "FREE_TRIAL"))
+    }
+
+    /// B6 in the host: when `AppTransaction.shared` fails, the receipt stands in, and StoreKit Testing's receipt does
+    /// not chain to Apple's root, so the client answers nothing and the engine keeps the snapshot it bound at launch.
+    @Test func a_failing_app_transaction_falls_back_to_the_receipt_which_fails_closed() async throws {
+        let (session, _) = try await start()
+        let engine = try #require(Paywall.shared.engine)
+        let bound = try #require(engine.appTransaction)
+        try await session.setSimulatedError(.generic(.unknown), forAPI: .appTransaction)
+        #expect(try await StoreKit2Client().appTransaction() == nil)
+        await Paywall.shared.refresh()
+        #expect(Paywall.shared.engine?.appTransaction == bound, "the cached snapshot stands")
+        try await session.setSimulatedError(nil as SKTestFailures.AppTransaction?, forAPI: .appTransaction)
+        #expect(try await StoreKit2Client().appTransaction() != nil)
+    }
+
+    /// A3 in the host: a renewal that fails with Billing Grace Period on. The store reports the grace end in the
+    /// renewal info; while StoreKit keeps listing the lapsed transaction, the subscriber stays paying through it.
+    @Test func a_renewal_that_fails_with_grace_keeps_the_subscriber_paying() async throws {
+        let (session, _) = try await start(timeRate: .oneRenewalEveryTwoSeconds)
+        session.shouldEnterBillingRetryOnRenewal = true
+        session.billingGracePeriodIsEnabled = true
+        defer { session.shouldEnterBillingRetryOnRenewal = false }
+        guard case .purchased = try await Paywall.shared.purchase(try await product("pro.monthly")) else { Issue.record("monthly"); return }
+        #expect(await waitUntil(30) { (try? await Paywall.shared.subscriptionPhase()) == .inGracePeriod })
+        let graceEnd = try await StoreKit2Client().renewalGraceEnd(groupID: hostCatalog.subscriptionGroupID)
+        #expect(graceEnd != nil, "the renewal info names the grace end")
+        await Paywall.shared.refresh()
+        var lapsedListed = false
+        for await result in Transaction.currentEntitlements {
+            guard case .verified(let transaction) = result, transaction.productID == "pro.monthly" else { continue }
+            lapsedListed = (transaction.expirationDate ?? .distantFuture) <= Date()
+        }
+        if lapsedListed {
+            guard case .subscribed(let subscription) = Paywall.shared.entitlement else {
+                Issue.record("expected a subscription in grace, got \(Paywall.shared.entitlement)")
+                return
+            }
+            #expect(subscription.phase == .inGracePeriod && subscription.gracePeriodEndsAt == graceEnd)
+            #expect(Paywall.shared.canPass(.paid))
+        } else {
+            print("grace: StoreKit Testing lists no lapsed transaction during grace; the engine resolved \(Paywall.shared.entitlement), grace end \(String(describing: graceEnd))")
+        }
     }
 
     /// 3.1.2(b): one group, so buying a higher tier upgrades; the old transaction is marked upgraded and ignored.
@@ -335,7 +421,13 @@ struct StoreKitIntegrationTests {
             #expect(request.productID == "pro.monthly" && request.offerID == "comeback")
             let engine = try #require(Paywall.shared.engine)
             #expect(request.transactionID == engine.appTransaction?.appTransactionID)
-            if #available(iOS 18.4, *) { #expect(request.transactionID != nil, "AppTransaction.appTransactionID binds the offer to this customer") }
+            #expect(request.transactionID != "", "B10: an empty id is no id; the worker refuses an empty one")
+            // B10: what StoreKit itself reports for this install, on every OS version the accessor is back-deployed to.
+            if #available(iOS 16.0, *), case .verified(let app) = try await AppTransaction.shared {
+                let reported = app.appTransactionID
+                #expect(request.transactionID == (reported.isEmpty ? nil : reported))
+                if #available(iOS 18.4, *) { #expect(request.transactionID != nil, "AppTransaction.appTransactionID binds the offer to this customer") }
+            }
         }
 
         // StoreKit's own record of the purchase names the offer.

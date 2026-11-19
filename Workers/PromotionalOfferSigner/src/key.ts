@@ -44,8 +44,9 @@ export async function importKey(pem: string): Promise<ImportedKey> {
     signingKey = await crypto.subtle.importKey("pkcs8", der, algorithm, false, ["sign"]);
     // A second, extractable import exists only to read the public point; it is dropped once that is done.
     exportable = await crypto.subtle.importKey("pkcs8", der, algorithm, true, ["sign"]);
-  } catch (error) {
-    throw new KeyError(`not an EC P-256 private key: ${error instanceof Error ? error.message : String(error)}`);
+  } catch {
+    // A fixed phrase: the runtime's own text is not forwarded, so no part of the key material can reach a log.
+    throw new KeyError("not an EC P-256 private key in PKCS#8 form");
   }
   // workers-types declares the union of exportKey's results; "jwk" always yields a JsonWebKey.
   const jwk = (await crypto.subtle.exportKey("jwk", exportable)) as JsonWebKey;

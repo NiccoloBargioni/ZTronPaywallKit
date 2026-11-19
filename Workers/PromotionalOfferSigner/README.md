@@ -40,9 +40,10 @@ POST /v1/promotional-offers/sign      Content-Type: application/json
 | 400 | `invalid_request` (+ `detail`) | a field is missing, malformed or unknown, or the body is not JSON |
 | 403 | `bundle_not_allowed` | `bundleId` is not in `APPLE_BUNDLE_IDS` |
 | 403 | `offer_not_allowed` | `ALLOWED_OFFERS` is set and does not list the offer for the product |
-| 413 | `payload_too_large` | more than 4 KB |
+| 413 | `payload_too_large` | more than 4 KB, counted in bytes as they arrive (the read stops there) |
 | 415 | `unsupported_media_type` | not `application/json` |
-| 500 | `misconfigured` | a secret is missing or malformed; the log names which, never its value |
+| 429 | `rate_limited` (+ `retry-after`) | only from a worker deployed with the optional `RATE_LIMITER` binding (below): this client address hit the limit |
+| 500 | `misconfigured` | a secret is missing or malformed; the log names which (and at most the position of the bad entry), never its value |
 
 `GET /v1/keys` serves the public point of the signing key as a JWKS (`kid`, `x`, `y`), so what the worker mints
 can be verified without Apple (the package's live test does). `GET /v1/health` answers `{"ok": true}`.
@@ -59,6 +60,7 @@ Integrations → **In-App Purchase** (the In-App Purchase key, not the App Store
 | `APPLE_IAP_ISSUER_ID` | the issuer id shown above the keys (a UUID) |
 | `APPLE_BUNDLE_IDS` | comma-separated bundle ids the worker signs for |
 | `ALLOWED_OFFERS` | optional, JSON `{"<productId>": ["<offerId>", …]}`: only these get signed |
+| `RATE_LIMITER` | optional, not a secret: a Rate Limiting binding declared in `wrangler.jsonc` (see "Security model") |
 
 ```bash
 npm install
@@ -85,10 +87,23 @@ is imported into WebCrypto once per isolate as a non-extractable key; only its p
 The endpoint is public by design, as the paywall that shows the offers is: anyone can obtain a signature for an
 offer of an allowed app, and the App Store still applies its own rules (promotional offers are for existing and
 lapsed subscribers, and the signature only ever grants an offer you configured). Who is *shown* an offer stays the
-app's decision, as it is without a server. `APPLE_BUNDLE_IDS` bounds the apps, `ALLOWED_OFFERS` the offers;
-Cloudflare's rate limiting rules bound the volume. If that decision has to hold against a tampered client, put App
-Attest in front of this worker: the package's `PromotionalOfferSigner` protocol is the seam for a client that
-attaches an assertion, and `src/app.ts` the place to check it.
+app's decision, as it is without a server. `APPLE_BUNDLE_IDS` bounds the apps, `ALLOWED_OFFERS` the offers (unused
+offers, that is: it cannot exclude an offer the app shows, and it does not stop a tampered client). If that decision
+has to hold against a tampered client, put App Attest in front of this worker: the package's
+`PromotionalOfferSigner` protocol is the seam for a client that attaches an assertion, and `src/app.ts` the place to
+check it.
+
+**Volume.** As deployed by the recipe above, nothing bounds the request volume: the worker has no limit of its own
+and a `workers.dev` hostname has none in front of it. On Workers Free the 100 000-requests-a-day cap is account-wide,
+so a flood stops offer purchases, and this account's other Workers, until 00:00 UTC. For production use Workers
+Paid, and put a bound in front:
+
+- The optional `RATE_LIMITER` binding (`ratelimits` in `wrangler.jsonc`, commented out there as an example) makes the
+  sign route answer `429 rate_limited` with `retry-after` per client IP, before the body is read. Throttled requests
+  still run the Worker and count toward the quota, so this bounds the signing, not the bill.
+- A route or custom domain with a WAF rate limiting rule stops excess requests before they reach the Worker. With a
+  custom domain set `workers_dev: false` and `preview_urls: false`, or the `workers.dev` hostname bypasses the rule.
+  Neither a domain nor an account belongs in this repository, so that configuration stays with the deployment.
 
 ## Development
 

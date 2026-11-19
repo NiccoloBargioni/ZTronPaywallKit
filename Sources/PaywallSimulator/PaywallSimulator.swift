@@ -78,6 +78,8 @@
             configuration.grandfathering = self.grandfathering
             configuration.tolerance = simulation.tolerance ?? configuration.tolerance
             configuration.includesDefaultAudit = true
+            // A fresh key per simulated journal: nothing of the simulation touches the Keychain.
+            configuration.fileKeyStore = InMemoryFileKeyStore()
             // The `tokens` switch is the balance: no welcome grant on top of it.
             configuration.welcomeTokens = 0
             let store = store
@@ -87,17 +89,24 @@
                 await self?.seed(engine)
             }
             // The store must hold the simulated state before the first resolution reads it.
-            applyTask = Task { await Self.push(snapshot, to: store, connectivity: connectivity) }
+            applyTask = Task { [weak self] in
+                await Self.push(snapshot, to: store, connectivity: connectivity)
+                // A store that never answers never lets `start()` finish, so `onStart` cannot seed: seed here.
+                guard !simulation.storeReachable, let self, let engine = self.engine else { return }
+                engine.simulateBalance(simulation.tokens)
+                if let tolerance = simulation.tolerance { engine.settings.tolerance = tolerance }
+                engine.simulateEntitlement(.unknown)
+            }
             return configuration
         }
 
-        /// Seeds the balance and the tolerance once the engine has started.
+        /// Seeds the balance and the tolerance once the engine has started. A store that never answers never lets it
+        /// start, so `applyTask` seeds that case itself (see `makeConfiguration`).
         private func seed(_ engine: GateEngine) async {
             await applyTask?.value
             engine.simulateBalance(simulation.tokens)
             if let tolerance = simulation.tolerance { engine.settings.tolerance = tolerance }
             await engine.refresh(cause: .simulation)
-            if !simulation.storeReachable, engine.entitlement != .unknown { engine.simulateEntitlement(.unknown) }
         }
 
         // MARK: Switches
@@ -128,13 +137,14 @@
             }
         }
 
-        /// Renews the current subscription for one more period.
+        /// Renews the current subscription for one more period (billing recovered, if it was in grace).
         public func renew() {
             guard case .subscribed(var subscription) = simulation.entitlement else { return }
             let base = max(subscription.expiresAt ?? clock.now, clock.now)
             subscription.expiresAt = base.addingTimeInterval(TimeInterval(subscription.tier.periodInDays) * 86_400)
             subscription.isTrial = false
             subscription.phase = .active
+            subscription.gracePeriodEndsAt = nil
             simulation.entitlement = .subscribed(subscription)
         }
 
@@ -144,10 +154,13 @@
             simulation.entitlement = .free
         }
 
-        /// Grace period keeps access.
+        /// Billing failed at the renewal and the App Store grants a grace period: the store keeps listing the lapsed
+        /// transaction (its expiration has passed) and reports the grace end, 16 days out, and access stays.
         public func enterGracePeriod() {
             guard case .subscribed(var subscription) = simulation.entitlement else { return }
             subscription.phase = .inGracePeriod
+            subscription.expiresAt = clock.now.addingTimeInterval(-60)
+            subscription.gracePeriodEndsAt = clock.now.addingTimeInterval(16 * 86_400)
             simulation.entitlement = .subscribed(subscription)
         }
 
@@ -231,6 +244,7 @@
             var next: FakeStore.NextPurchase
             var introEligible: Bool
             var phase: SubscriptionPhase?
+            var graceEnd: Date?
             var products: [PaywallProduct]
         }
 
@@ -241,12 +255,19 @@
             var entitlements: [StoreTransaction] = []
             var app: AppTransactionSnapshot?
             var phase: SubscriptionPhase?
+            var graceEnd: Date?
             switch simulation.entitlement {
             case .unknown, .free:
                 break
             case .subscribed(let subscription):
                 let productID = catalog?.subscriptions[subscription.tier] ?? subscription.productID
-                let expires = subscription.expiresAt ?? now.addingTimeInterval(TimeInterval(subscription.tier.periodInDays) * 86_400)
+                var expires = subscription.expiresAt ?? now.addingTimeInterval(TimeInterval(subscription.tier.periodInDays) * 86_400)
+                if subscription.phase == .inGracePeriod {
+                    // What StoreKit shows during grace: the lapsed transaction stays listed, the grace end is in the
+                    // renewal info.
+                    expires = min(expires, now.addingTimeInterval(-60))
+                    graceEnd = subscription.gracePeriodEndsAt ?? now.addingTimeInterval(16 * 86_400)
+                }
                 entitlements = [
                     .subscription(
                         id: Self.subscriptionTransactionID, productID: productID, purchased: now.addingTimeInterval(-60),
@@ -275,7 +296,7 @@
             }
             return StoreState(
                 entitlements: entitlements, app: app, reachable: simulation.storeReachable, network: simulation.network,
-                next: next, introEligible: simulation.introOfferEligible, phase: phase,
+                next: next, introEligible: simulation.introOfferEligible, phase: phase, graceEnd: graceEnd,
                 products: Self.products(for: catalog, introEligible: simulation.introOfferEligible))
         }
 
@@ -283,12 +304,14 @@
             await connectivity.set(state.network)
             await store.setEntitlements(state.entitlements)
             await store.setApp(state.app)
-            await store.setReachable(state.reachable)
             await store.setNetwork(state.network)
             await store.setNextPurchase(state.next)
             await store.setIntroEligible(state.introEligible)
             await store.setPhase(state.phase)
+            await store.setGraceEnd(state.graceEnd)
             await store.setProducts(state.products)
+            // Last: `true` releases the reads a store that was down held, and they read the state above.
+            await store.setReachable(state.reachable)
         }
 
         /// Euro prices in cents: the display string and the exact figure behind it.
@@ -336,8 +359,9 @@
     }
 
     extension Paywall.Configuration {
-        /// A drop-in configuration driven by `PaywallSimulator.shared`. Debug builds only; a non-debug process
-        /// never links this product.
+        /// A drop-in configuration driven by `PaywallSimulator.shared`. Debug builds only: in a release build this
+        /// module and the fakes it drives (`ZTronPaywallTesting`) compile to nothing, and
+        /// `Scripts/check-release-symbols.sh` checks that they did.
         public static func simulated(
             _ simulation: PaywallSimulation = PaywallSimulation(),
             catalog: ProductCatalog,

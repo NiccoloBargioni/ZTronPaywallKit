@@ -160,6 +160,7 @@ struct NotificationNamesTests {
         defer { for observer in observers { center.removeObserver(observer) } }
         let paywall = Paywall()
         var configuration = Paywall.Configuration(catalog: catalog)
+        configuration.fileKeyStore = InMemoryFileKeyStore()
         configuration.store = FakeStore(products: products)
         configuration.clock = FakeClock()
         configuration.storageDirectory = makeTemporaryPaywallDirectory()

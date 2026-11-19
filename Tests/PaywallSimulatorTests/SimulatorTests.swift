@@ -63,10 +63,17 @@
 
     private let catalog = ProductCatalog.simulatorDefault
 
+    /// A store that never answers never lets `start()` finish (that is the point of `storeReachable == false`): wait
+    /// for the switches to reach the engine instead.
     @MainActor
     private func configure(_ simulation: PaywallSimulation) async {
         Paywall.shared.configure(.simulated(simulation, catalog: catalog))
-        await Paywall.shared.waitUntilStarted()
+        if simulation.storeReachable {
+            await Paywall.shared.waitUntilStarted()
+        } else {
+            await PaywallSimulator.shared.settle()
+            for _ in 0..<50 where Paywall.shared.engine?.entitlement != .unknown { await Task.yield() }
+        }
     }
 
     @MainActor
@@ -294,6 +301,14 @@
             simulator.enterGracePeriod()
             await simulator.settle()
             #expect(Paywall.shared.entitlement.isPaying)
+            // A3: the listed row has lapsed; the grace the store reports is what keeps it subscribed.
+            if case .subscribed(let graced) = Paywall.shared.entitlement {
+                #expect(graced.phase == .inGracePeriod && graced.gracePeriodEndsAt != nil)
+                #expect(graced.expiresAt.map { $0 < (graced.gracePeriodEndsAt ?? .distantPast) } == true, "the failed renewal is in the past")
+                #expect(graced.accessEndsAt == graced.gracePeriodEndsAt)
+            } else {
+                Issue.record("expected a subscription in grace, got \(Paywall.shared.entitlement)")
+            }
             #expect(try! await Paywall.shared.subscriptionPhase() == .inGracePeriod)
             simulator.enterBillingRetry()
             var lapsed = false
@@ -311,6 +326,44 @@
             simulator.enterGracePeriod()
             simulator.enterBillingRetry()
             simulator.expire()
+        }
+
+        /// A simulator never configured: the store state falls back to the preset's own product ids and policy, the
+        /// storefront is empty, and the switches that need a catalog do nothing.
+        @Test func a_simulator_without_a_catalog_falls_back_to_defaults() {
+            let bare = PaywallSimulator()
+            var inGrace = PaywallSimulation(.monthly)
+            inGrace.entitlement = .subscription(.monthly, phase: .inGracePeriod)
+            let graced = bare.storeState(for: inGrace)
+            #expect(graced.graceEnd != nil && graced.entitlements.first?.productID == "pro.monthly")
+            #expect(bare.storeState(for: PaywallSimulation(.lifetime)).entitlements.first?.productID == "pro.lifetime")
+            var shared = PaywallSimulation(.lifetime)
+            shared.entitlement = .lifetime(.familyShared(transactionID: 3))
+            #expect(bare.storeState(for: shared).entitlements.first?.ownership == .familyShared)
+            #expect(bare.storeState(for: PaywallSimulation(.grandfathered)).app?.originalAppVersion == PaywallSimulator.simulatedPolicy.lastPaidBuild)
+            #expect(PaywallSimulator.products(for: nil, introEligible: true).isEmpty)
+            bare.purchaseTokenPack()
+            bare.reset()
+            bare.refund(.lifetime)  // not a lifetime: nothing to refund
+            #expect(bare.simulation.entitlement == PaywallSimulation().entitlement)
+        }
+
+        /// B14: a store that never answers still takes the simulation's tolerance, seeded without a resolution.
+        @Test func a_store_down_simulation_applies_its_tolerance_without_a_resolution() async {
+            var simulation = PaywallSimulation(.storeDown)
+            simulation.tolerance = 42
+            await configure(simulation)
+            #expect(Paywall.shared.engine?.settings.tolerance == 42)
+            #expect(Paywall.shared.engine?.entitlement == .unknown)
+        }
+
+        @Test func a_grandfathering_policy_with_no_environment_simulates_production() async {
+            let policy = GrandfatheringPolicy(
+                environments: [], lastPaidBuild: "116",
+                paidWindow: DateInterval(start: Date(timeIntervalSince1970: 1_600_000_000), end: Date(timeIntervalSince1970: 1_700_000_000)))
+            Paywall.shared.configure(.simulated(PaywallSimulation(.grandfathered), catalog: catalog, grandfathering: policy))
+            await Paywall.shared.waitUntilStarted()
+            #expect(Paywall.shared.engine?.appTransaction?.environment == .production)
         }
 
         @Test func lease_window_with_simulated_clock() async {
@@ -438,6 +491,7 @@
 
         @Test func launch_arguments_pick_the_fake_only_when_present() async {
             var production = Paywall.Configuration(catalog: catalog)
+            production.fileKeyStore = InMemoryFileKeyStore()
             production.grandfathering = GrandfatheringPolicy(
                 lastPaidBuild: "116",
                 paidWindow: DateInterval(start: Date(timeIntervalSince1970: 0), end: Date(timeIntervalSince1970: 1_700_000_000)))
@@ -472,6 +526,7 @@
 
         @Test func use_switches_from_production_to_the_fake_and_back() async {
             var production = Paywall.Configuration(catalog: catalog)
+            production.fileKeyStore = InMemoryFileKeyStore()
             production.store = FakeStore()  // this process is not entitled for StoreKit; the label is what is under test
             production.clock = FakeClock()
             production.storageDirectory = makeTemporaryPaywallDirectory()
@@ -520,6 +575,7 @@
         /// A production configuration for the shared facade that never reaches StoreKit (this process is not entitled).
         private func productionConfiguration(catalog: ProductCatalog, grandfathering: GrandfatheringPolicy? = nil) -> Paywall.Configuration {
             var production = Paywall.Configuration(catalog: catalog)
+            production.fileKeyStore = InMemoryFileKeyStore()
             production.grandfathering = grandfathering
             production.store = FakeStore()
             production.clock = FakeClock()

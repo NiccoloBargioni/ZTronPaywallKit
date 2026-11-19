@@ -115,13 +115,18 @@ struct LiveCloudKitTests {
         #expect(next != nil && next != start)
         #expect(try await database.fetchChanges(since: next).records.isEmpty)
 
-        // The carrier over the same container, with its change token next to the journal in Application Support.
+        // The carrier over the same container. The position is the engine's to keep (in its journal), so the carrier
+        // pulls from whatever cursor it is given and leaves no token file of its own in Application Support.
+        try Data("legacy".utf8).write(to: PaywallCloudSync.defaultTokenURL)
         let carrier = PaywallCloudSync(containerIdentifier: container, keychain: nil)
         #expect(try await carrier.push([event]) == [event.id])
-        #expect(try await carrier.pull() == [event])
-        #expect(FileManager.default.fileExists(atPath: PaywallCloudSync.defaultTokenURL.path))
-        // A relaunch starts from the stored token: nothing is delivered twice.
-        #expect(try await PaywallCloudSync(containerIdentifier: container, keychain: nil).pull().isEmpty)
+        let pulled = try #require(try await carrier.pull(since: nil))
+        #expect(pulled.events == [event] && pulled.accountAvailable)
+        #expect(!FileManager.default.fileExists(atPath: PaywallCloudSync.defaultTokenURL.path), "the legacy token file is deleted")
+        // A relaunch that stored the cursor gets nothing new; one that lost it (a reinstall) gets the history again.
+        let relaunched = PaywallCloudSync(containerIdentifier: container, keychain: nil)
+        #expect(try await relaunched.pull(since: pulled.cursor)?.events.isEmpty == true)
+        #expect(try await PaywallCloudSync(containerIdentifier: container, keychain: nil).pull() == [event])
     }
 
     /// Two devices on one iCloud account: a purchase on one is spendable on the other, and draws made before either

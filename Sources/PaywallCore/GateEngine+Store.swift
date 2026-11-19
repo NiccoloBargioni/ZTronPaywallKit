@@ -1,40 +1,70 @@
-import Foundation
+public import Foundation
 import Logging
 
 extension GateEngine {
     // MARK: Resolution
 
-    /// Re-derives the entitlement from `currentEntitlements` (StoreKit's on-device cache) and the app transaction,
-    /// reconciles revoked token packs, and re-arms the expiry timer. Never waits for the network.
+    /// Re-derives the entitlement from `currentEntitlements` and the app transaction, reconciles revoked token packs,
+    /// retries the pack credits the journal could not write, and re-arms the expiry timer.
+    ///
+    /// `currentEntitlements` and `Transaction.all` come from StoreKit's on-device cache. The app transaction comes from
+    /// `AppTransaction.shared`, which asks the App Store when none is cached for this app version (typically the first
+    /// launch), so this resolution can wait on the network; offline it fails and the cached snapshot, or the receipt
+    /// behind the store client, answers. A lapsed subscription StoreKit still lists costs one more App Store read, for
+    /// the end of its billing grace period. Never prompts.
+    ///
+    /// Resolutions overlap (a launch resolution stalled on the App Store while a purchase resolves). Each is stamped
+    /// when it starts and applied only when no newer one was applied first, so a stale read never undoes a purchase
+    /// or a refund resolved meanwhile.
     public func refresh(cause: EntitlementChangeCause) async {
-        guard !isTerminated else { return }
+        guard !isTerminated, !isShutDown else { return }
+        resolutionGeneration += 1
+        let generation = resolutionGeneration
         let transactions: [StoreTransaction]
         do {
             transactions = try await store.currentEntitlements()
         } catch {
-            let age = PaywallFiles(directory: directory).entitlementSnapshotDate().map { clock.now.timeIntervalSince($0) }
+            guard !isTerminated, !isShutDown else { return }
+            // StoreKit's own reads never throw; a host-written store client's may, and the cached snapshot stands.
+            let age = PaywallFiles(directory: directory, keyStore: fileKeyStore).entitlementSnapshotDate().map { clock.now.timeIntervalSince($0) }
             emit(.storeUnavailable(error: String(describing: error), snapshotAge: age))
             return
         }
+        guard !isTerminated, !isShutDown else { return }
         // A fresh install offline has no AppTransaction; the cached snapshot (or the receipt behind the store
         // client) answers, and the grant is re-checked on the next online resolution.
-        if let fresh = try? await store.appTransaction() {
-            bind(fresh)
+        let fresh = try? await store.appTransaction()
+        guard !isTerminated, !isShutDown else { return }
+        let rebound = fresh.map { bind($0) } ?? false
+        var graceEnd: Date?
+        if resolver.needsGraceEnd(transactions: transactions, now: clock.now) {
+            graceEnd = try? await store.renewalGraceEnd(groupID: catalog.subscriptionGroupID)
+            guard !isTerminated, !isShutDown else { return }
         }
-        guard !isTerminated else { return }
-        let resolution = resolver.resolve(transactions: transactions, appTransaction: resolverInput, now: clock.now)
-        lastResolution = clock.now
-        if let grandfathered = resolution.grandfathered { recordGrandfather(grandfathered) }
-        setEntitlement(resolution.entitlement, cause: cause)
-        // Saved on every successful resolution: `resolvedAt` is the snapshot age `storeUnavailable` reports.
-        PaywallFiles(directory: directory).saveEntitlementSnapshot(resolution.entitlement, at: clock.now)
-        armExpiryTimer(resolution.expiresAt)
+        if generation > lastAppliedGeneration {
+            // Synchronous from here to the timer: nothing may run between the check and the apply.
+            lastAppliedGeneration = generation
+            let resolution = resolver.resolve(transactions: transactions, appTransaction: resolverInput, now: clock.now, graceEnd: graceEnd)
+            lastResolution = clock.now
+            if let grandfathered = resolution.grandfathered { recordGrandfather(grandfathered, storeAnswered: fresh != nil) }
+            setEntitlement(resolution.entitlement, cause: cause)
+            // Saved on every applied resolution: `resolvedAt` is the snapshot age `storeUnavailable` reports.
+            PaywallFiles(directory: directory, keyStore: fileKeyStore).saveEntitlementSnapshot(resolution.entitlement, at: clock.now)
+            armExpiryTimer(resolution.expiresAt)
+        } else if rebound {
+            // A newer resolution was applied while this one waited, and this one bound another app transaction, which
+            // the grandfather rule reads: resolve once more, with a stamp of its own.
+            Task { [weak self] in await self?.refresh(cause: cause) }
+        }
 
         if let all = try? await store.allTransactions() {
+            guard !isTerminated, !isShutDown else { return }
             for planned in CreditReconciler.planRevocations(in: all, catalog: catalog, ledger: ledger) {
                 applyPlanned(planned)
             }
         }
+        await retryUnfinishedPacks()
+        guard !isTerminated, !isShutDown else { return }
         reevaluateSessions()
     }
 
@@ -48,27 +78,35 @@ extension GateEngine {
         return appTransaction
     }
 
-    func bind(_ snapshot: AppTransactionSnapshot) {
+    /// Binds the store's answer: the snapshot the resolver and the offer signing read, and the account partition the
+    /// wallet counts. Returns whether anything changed.
+    @discardableResult
+    func bind(_ snapshot: AppTransactionSnapshot) -> Bool {
+        let changed = snapshot != appTransaction
         appTransaction = snapshot
-        let files = PaywallFiles(directory: directory)
+        let files = PaywallFiles(directory: directory, keyStore: fileKeyStore)
         files.saveAppTransaction(snapshot)
         let key = snapshot.accountKey
         if key != accountKey {
             accountKey = key
-            files.saveAccountKey(key)
             recomputeLeasesAndWallet(notify: true)
+            // The Keychain item is per account: a rebind writes this account's snapshot even when the balance stayed.
+            persistSnapshot()
         }
+        return changed
     }
 
-    private func recordGrandfather(_ snapshot: AppTransactionSnapshot) {
-        let files = PaywallFiles(directory: directory)
+    /// `storeAnswered`: the admitting snapshot came from the store in this very resolution. The token grant is minted
+    /// only then, never from a cached snapshot alone, so a planted cache can mint nothing offline.
+    private func recordGrandfather(_ snapshot: AppTransactionSnapshot, storeAnswered: Bool) {
+        let files = PaywallFiles(directory: directory, keyStore: fileKeyStore)
         if !files.grandfatherLogged() {
             files.markGrandfatherLogged()
             emit(.grandfathered(
                 originalAppVersion: snapshot.originalAppVersion, originalPurchaseDate: snapshot.originalPurchaseDate,
                 environment: snapshot.environment))
         }
-        if case .tokens(let n) = grandfathering?.grant {
+        if storeAnswered, case .tokens(let n) = grandfathering?.grant {
             grant(tokens: n, reason: "grandfathered", id: "grant:grandfathered:\(accountKey)")
         }
     }
@@ -100,11 +138,40 @@ extension GateEngine {
         }
     }
 
+    /// Whether every event `transaction` implies is in the ledger: what must hold before it is finished, because a
+    /// finished transaction is never delivered again.
+    func landed(_ transaction: StoreTransaction) -> Bool {
+        CreditReconciler.plan(for: transaction, catalog: catalog, ledger: ledger).isEmpty
+    }
+
+    func rememberUnfinished(_ transaction: StoreTransaction) {
+        logger.warning("store: transaction left unfinished, its credit is not in the ledger", metadata: ["id": "\(transaction.id)"])
+        guard !unfinishedPacks.contains(where: { $0.id == transaction.id }) else { return }
+        unfinishedPacks.append(transaction)
+    }
+
+    /// Credits the packs whose write failed earlier, and finishes each one once its events landed.
+    func retryUnfinishedPacks() async {
+        guard !unfinishedPacks.isEmpty, !retryingUnfinished, !isTerminated, !isShutDown else { return }
+        retryingUnfinished = true
+        defer { retryingUnfinished = false }
+        for transaction in unfinishedPacks {
+            for planned in CreditReconciler.plan(for: transaction, catalog: catalog, ledger: ledger) {
+                applyPlanned(planned)
+            }
+            guard landed(transaction) else { continue }
+            unfinishedPacks.removeAll { $0.id == transaction.id }
+            await store.finish(transactionID: transaction.id)
+            guard !isTerminated, !isShutDown else { return }
+        }
+    }
+
     // MARK: Transaction.updates
 
     func startUpdatesListener() async {
         updatesTask?.cancel()
         let updates = await store.updates()
+        guard !isShutDown else { return }
         updatesTask = Task { [weak self] in
             for await transaction in updates {
                 guard let self, !Task.isCancelled else { return }
@@ -113,15 +180,37 @@ extension GateEngine {
         }
     }
 
-    /// Credit or revoke, re-resolve, publish, log, and only then `finish()`.
-    public func handle(_ transaction: StoreTransaction) async {
-        guard !isTerminated else { return }
+    /// Credit or revoke, re-resolve, publish, log, and only then `finish()`: the transaction is finished once every
+    /// event it implies is in the ledger, and not before. A credit the journal could not write leaves it unfinished,
+    /// so StoreKit delivers it again at the next launch and the deterministic `credit:<id>` credits it once.
+    /// Returns whether it was finished.
+    @discardableResult
+    public func handle(_ transaction: StoreTransaction) async -> Bool {
+        guard !isTerminated, !isShutDown else { return false }
         for planned in CreditReconciler.plan(for: transaction, catalog: catalog, ledger: ledger) {
             applyPlanned(planned)
         }
         await refresh(cause: transaction.revocationDate != nil ? .revoked : .update)
-        guard !isTerminated else { return }
+        guard !isTerminated, !isShutDown else { return false }
+        guard landed(transaction) else {
+            rememberUnfinished(transaction)
+            return false
+        }
         await store.finish(transactionID: transaction.id)
+        return true
+    }
+
+    /// A purchase that completed on an engine the facade had already shut down (a reconfigure during the payment
+    /// sheet) lands here, on the current engine: credited, finished once the credit is in the ledger, and published as
+    /// completed. Returns whether it was finished.
+    @discardableResult
+    public func adoptPurchase(_ transaction: StoreTransaction, source: PaywallSource?) async -> Bool {
+        guard await handle(transaction) else { return false }
+        emit(.purchase(stage: .completed, productID: transaction.productID, source: source, transactionID: transaction.id))
+        await sync?.requestPull()
+        scheduleSync(immediately: true)
+        scheduleStorefrontRefresh()
+        return true
     }
 
     // MARK: Promoted in-app purchases
@@ -131,6 +220,7 @@ extension GateEngine {
     func startPurchaseIntentsListener() async {
         intentsTask?.cancel()
         let intents = await store.purchaseIntents()
+        guard !isShutDown else { return }
         intentsTask = Task { [weak self] in
             for await productID in intents {
                 guard let self, !Task.isCancelled else { return }
@@ -179,7 +269,7 @@ extension GateEngine {
         let next = PaywallStorefront(products: listed, unavailableProductIDs: unavailable, countryCode: countryCode, fetchedAt: clock.now)
         let changed = storefront.map { !$0.hasSameListing(as: next) } ?? true
         storefront = next
-        PaywallFiles(directory: directory).saveStorefront(next)
+        PaywallFiles(directory: directory, keyStore: fileKeyStore).saveStorefront(next)
         if changed { emit(.storefrontChanged(productIDs: listed.map(\.id), countryCode: countryCode)) }
         onStateChange?()
         return next
@@ -205,10 +295,13 @@ extension GateEngine {
 
     // MARK: Purchases
 
-    /// The credit is written before `finish()`: if the app dies in between, `Transaction.updates` re-delivers the
-    /// transaction and the deterministic credit id makes the second write a no-op. With `offer`, a promotional offer of
-    /// the product, the signer is asked for this install's signature first and the store buys with it; a signing
-    /// failure fails the purchase before the payment sheet, like a store error.
+    /// The credit is written before `finish()`, and `finish()` runs only once the credit is in the ledger: if the app
+    /// dies in between, or the journal could not take the credit, `Transaction.updates` delivers the transaction again
+    /// and the deterministic credit id makes the second write a no-op. A credit the journal refused answers `.pending`,
+    /// like Ask to Buy: the tokens arrive when the transaction is delivered again (at the next resolution of this
+    /// launch, or at the next launch). With `offer`, a promotional offer of the product, the signer is asked for this
+    /// install's signature first and the store buys with it; a signing failure fails the purchase before the payment
+    /// sheet, like a store error.
     public func purchase(productID: String, offer: PaywallProduct.Offer? = nil, source: PaywallSource?) async throws -> PurchaseOutcome {
         emit(.purchase(stage: .started, productID: productID, source: source, transactionID: nil))
         let result: StorePurchaseResult
@@ -222,11 +315,19 @@ extension GateEngine {
         }
         switch result {
         case .success(let transaction):
+            guard !isTerminated, !isShutDown else { return await handOff(transaction, source: source) }
             for planned in CreditReconciler.plan(for: transaction, catalog: catalog, ledger: ledger) {
                 applyPlanned(planned)
             }
             await refresh(cause: .purchase)
+            guard !isTerminated, !isShutDown else { return await handOff(transaction, source: source) }
+            guard landed(transaction) else {
+                rememberUnfinished(transaction)
+                emit(.purchase(stage: .pending, productID: productID, source: source, transactionID: transaction.id))
+                return .pending
+            }
             await store.finish(transactionID: transaction.id)
+            guard !isTerminated, !isShutDown else { return .purchased(transactionID: transaction.id) }
             emit(.purchase(stage: .completed, productID: productID, source: source, transactionID: transaction.id))
             await sync?.requestPull()
             scheduleSync(immediately: true)
@@ -241,18 +342,27 @@ extension GateEngine {
         }
     }
 
+    /// Paid for after `shutdown()`: nothing durable happens on this engine. The facade's current engine takes the
+    /// transaction (`onOrphanedPurchase`); with none, it stays unfinished for the next launch's `Transaction.updates`.
+    private func handOff(_ transaction: StoreTransaction, source: PaywallSource?) async -> PurchaseOutcome {
+        if let onOrphanedPurchase, await onOrphanedPurchase(transaction, source) { return .purchased(transactionID: transaction.id) }
+        return .pending
+    }
+
     /// Asks the signer for this install's signature of `offer` on `productID`: the one-time JWS the store takes. The
     /// request names the app (the settings' bundle id, else the app transaction's), the product, the offer and the
-    /// app transaction id when the store reported one, so the App Store can bind the offer to this customer.
+    /// app transaction id when the store reported one (iOS 16 and later), so the App Store can bind the offer to this
+    /// customer. An empty id is no id: a third-party store client may hand one over.
     func signPromotionalOffer(_ offer: PaywallProduct.Offer, productID: String) async throws -> SignedPromotionalOffer {
         guard offer.kind == .promotional, let offerID = offer.id else { throw PromotionalOfferError.notPromotional }
         guard let signer = promotionalOfferSigner else { throw PromotionalOfferError.signerNotConfigured }
         guard let bundleID = settings.bundleID ?? appTransaction?.bundleID else { throw PromotionalOfferError.bundleIDUnknown }
-        let request = PromotionalOfferSigningRequest(
-            bundleID: bundleID, productID: productID, offerID: offerID, transactionID: appTransaction?.appTransactionID)
+        let transactionID = appTransaction?.appTransactionID.flatMap { $0.isEmpty ? nil : $0 }
+        let request = PromotionalOfferSigningRequest(bundleID: bundleID, productID: productID, offerID: offerID, transactionID: transactionID)
         let signed = try await signer.sign(request)
         guard signed.productID == productID, signed.offerID == offerID else {
-            throw PromotionalOfferError.signatureMismatch(received: signed)
+            // The answer's ids only: the token itself is single-use, and nothing of it belongs in a log.
+            throw PromotionalOfferError.signatureMismatch(productID: signed.productID, offerID: signed.offerID)
         }
         emit(.promotionalOfferSigned(productID: productID, offerID: offerID))
         return signed
@@ -267,7 +377,9 @@ extension GateEngine {
             emit(.restore(stage: .failed(String(describing: error))))
             throw error
         }
+        guard !isTerminated, !isShutDown else { return }
         await refresh(cause: .restore)
+        guard !isTerminated, !isShutDown else { return }
         emit(.restore(stage: .completed))
         await sync?.requestPull()
         await syncNow()
@@ -287,6 +399,7 @@ extension GateEngine {
         connectivityTask?.cancel()
         guard let connectivity else { return }
         let paths = await connectivity.paths()
+        guard !isShutDown else { return }
         connectivityTask = Task { [weak self] in
             for await hasPath in paths {
                 guard let self, !Task.isCancelled else { return }
@@ -347,60 +460,101 @@ extension GateEngine {
         syncTask = nil
         guard let sync, !isTerminated, !isShutDown, hasNetworkPath else { return }
         lastSyncAt = clock.now
-        let pending = journal.pendingUpload
-        if !pending.isEmpty, let acknowledged = try? await sync.push(pending) {
-            let ids = pending.map(\.id).filter(acknowledged.contains)
-            if !ids.isEmpty, !isTerminated, !isShutDown { try? journal.append(.uploaded(ids)) }
+        if carrierHasAccount { await push(to: sync) }
+        guard !isTerminated, !isShutDown else { return }
+        // The engine owns the cursor: the carrier fetches from the journal's, and the cursor it hands back is written
+        // with the merged events, in one write. A failed merge leaves it where it was, so the next fetch brings the
+        // same events again; a shutdown meanwhile drops the answer for the successor to fetch.
+        let pulled: LedgerPull?
+        do {
+            pulled = try await sync.pull(since: journal.cursor)
+        } catch {
+            return
         }
-        guard let remote = try? await sync.pull(), !isTerminated, !isShutDown else { return }
-        merge(remote)
-        settleBaseline(afterPulling: remote)
-        // The carrier has answered: an account with no history anywhere is new.
+        guard let pulled, !isTerminated, !isShutDown else { return }
+        let regained = !carrierHasAccount && pulled.accountAvailable
+        carrierHasAccount = pulled.accountAvailable
+        guard merge(pulled.events, cursor: pulled.cursor) else {
+            await sync.requestPull()
+            return
+        }
+        // The carrier has answered and the answer is durable: an account with no history anywhere is new.
         grantWelcomeIfNew()
+        if regained { await push(to: sync) }
     }
 
-    /// Union merge by id. Carriers only add events, so a merge can never remove a debit.
-    public func merge(_ remote: [LedgerEvent]) {
+    /// Uploads the outbox and acknowledges what the carrier took. Skipped while the last pull said the device has no
+    /// account for the carrier: nothing would be taken, and encoding the outbox at every sync is what it would cost.
+    private func push(to sync: any LedgerSync) async {
+        let pending = journal.pendingUpload
+        guard !pending.isEmpty else { return }
+        // A push that fails is retried at the next sync; whether the device has an account is the pull's to say.
+        guard let acknowledged = try? await sync.push(pending) else { return }
+        guard !isTerminated, !isShutDown else { return }
+        let ids = pending.map(\.id).filter(acknowledged.contains)
+        if !ids.isEmpty {
+            do {
+                try journal.acknowledge(ids)
+            } catch {
+                logger.error("journal: acknowledgement failed", metadata: ["error": "\(error)"])
+            }
+        }
+    }
+
+    /// Union merge by id, with the carrier's `cursor` written in the same `write(2)` as the events it covers. Carriers
+    /// only add events, so a merge can never remove a debit. Settles the Keychain baseline when the batch holds
+    /// history for its account (events new to this ledger, so never this install's own echoed pushes), or its named
+    /// last event. Returns whether everything landed: `true` with nothing fresh, `false` when the journal refused the
+    /// write, in which case the ledger, the baseline and the cursor are as they were.
+    @discardableResult
+    public func merge(_ remote: [LedgerEvent], cursor: Data? = nil) -> Bool {
+        guard !isTerminated, !isShutDown else { return false }
         var seen = Set<String>()
         let fresh = remote
             .filter { !ledger.contains($0.id) && seen.insert($0.id).inserted }
             .sorted { ($0.deviceID, $0.at) < ($1.deviceID, $1.at) }
-        guard !fresh.isEmpty else { return }
+        var entries: [JournalEntry] = fresh.map { .event($0, uploaded: true) }
+        let settles = baseline.map { baseline in
+            fresh.contains { $0.accountKey == baseline.accountKey || $0.accountKey == unboundAccountKey }
+                || baseline.lastEventID.map { id in fresh.contains { $0.id == id } } ?? false
+        } ?? false
+        if settles { entries.append(.baselineSettled) }
+        // The cursor is stored whenever the carrier moved it, with the events it covers (which may all be echoes of
+        // this install's own pushes: the position still advances, so a device that only pushes never re-fetches its
+        // history). An unchanged cursor writes nothing, so a quiet account costs no frame per pull.
+        if let cursor, cursor != journal.cursor { entries.append(.cursor(cursor)) }
+        guard !entries.isEmpty else { return true }
         let balanceBefore = wallet.balance
         do {
-            try journal.append(contentsOf: fresh.map { .event($0, uploaded: true) })
+            try journal.append(contentsOf: entries)
         } catch {
             logger.error("journal: merge failed", metadata: ["error": "\(error)"])
-            return
+            return false
         }
         for event in fresh { ledger.append(event) }
+        if settles { baseline = nil }
+        guard !fresh.isEmpty || settles else { return true }
         recomputeLeasesAndWallet(notify: true)
-        let devices = Array(Set(fresh.map(\.deviceID))).sorted()
-        emit(.syncMerged(count: fresh.count, fromDeviceIDs: devices), balanceBefore: balanceBefore)
+        if !fresh.isEmpty {
+            let devices = Array(Set(fresh.map(\.deviceID))).sorted()
+            emit(.syncMerged(count: fresh.count, fromDeviceIDs: devices), balanceBefore: balanceBefore)
+        }
         reevaluateSessions()
+        return true
     }
 
-    /// After a reinstall the Keychain snapshot stands in for the history this install has not seen. Once the
-    /// carrier has answered with events for this account, the snapshot has done its job: if its last event is
-    /// among them the ledger is complete; if not, that event was never uploaded and died with the old install, and
-    /// keeping the snapshot on top of the remote history would count every uploaded credit twice. Either way the
-    /// carrier is the truth from here. A carrier that answers with nothing (iCloud off, empty container) leaves the
-    /// snapshot standing.
-    func settleBaseline(afterPulling remote: [LedgerEvent]) {
-        guard let baseline else { return }
-        let seenLast = baseline.lastEventID.map(ledger.contains) ?? true
-        let answered = remote.contains { $0.accountKey == accountKey || $0.accountKey == unboundAccountKey }
-        guard seenLast || answered else { return }
-        self.baseline = nil
-        recomputeLeasesAndWallet(notify: true)
-        reevaluateSessions()
-    }
-
+    /// The Keychain item: this account's balance, and while a baseline stands, the baseline's provenance (its last
+    /// event, with the balance as baseline plus what this install wrote since), so a second reinstall, or a dropped
+    /// log, adopts the same history again. Nothing is written while the engine is unbound and a baseline for a bound
+    /// account stands (the item is that account's), and `{0, nil}` is never written (it says nothing and would replace
+    /// another account's item).
     func persistSnapshot() {
         guard let sync, !isShutDown else { return }
-        let snapshot = WalletSnapshot(
-            accountKey: accountKey, balance: ledger.balance(for: accountKey, baseline: baseline),
-            lastEventID: ledger.lastEventID, headHash: ledger.head(for: deviceID))
+        if accountKey == unboundAccountKey, let baseline, baseline.accountKey != unboundAccountKey { return }
+        let lastEventID = baseline?.lastEventID ?? ledger.lastEventID
+        let balance = ledger.balance(for: accountKey, baseline: baseline)
+        guard balance != 0 || lastEventID != nil else { return }
+        let snapshot = WalletSnapshot(accountKey: accountKey, balance: balance, lastEventID: lastEventID, headHash: ledger.head(for: deviceID))
         snapshotTask?.cancel()
         snapshotTask = Task { await sync.saveSnapshot(snapshot) }
     }

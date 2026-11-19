@@ -1,4 +1,4 @@
-import Foundation
+public import Foundation
 public import PaywallCore
 import StoreKit
 
@@ -8,7 +8,8 @@ import StoreKit
 /// Every method is `@concurrent`: StoreKit's own work and the receipt parse run off the caller's actor, so the
 /// main actor's only disk I/O stays the draw path (concurrency requirement 7).
 public struct StoreKit2Client: StoreClient {
-    /// The iOS 15 path for the app transaction, and the fallback when `AppTransaction` is unavailable offline.
+    /// The iOS 15 path for the app transaction, and the fallback when `AppTransaction.shared` throws (offline, with
+    /// nothing cached for this app version).
     public var receipt: ReceiptClient
 
     public init(receipt: ReceiptClient = ReceiptClient()) {
@@ -33,25 +34,44 @@ public struct StoreKit2Client: StoreClient {
         return transactions
     }
 
-    /// `AppTransaction.shared` on iOS 16 / macOS 13, verified; otherwise, or when it throws offline, the receipt.
-    /// Never refreshes either: both can prompt for an Apple ID password.
+    /// What `AppTransaction.shared` answered, reduced to the decision the receipt fallback is made on.
+    enum AppTransactionAnswer: Hashable, Sendable { case verified, unverified, failed }
+
+    /// The receipt stands in only when the store could not answer. An answer that failed verification is an answer:
+    /// falling back to the receipt there would let a planted receipt override what StoreKit said about this install.
+    static func usesReceipt(after answer: AppTransactionAnswer) -> Bool { answer == .failed }
+
+    /// `""` is what the back-deployed `appTransactionID` reads on iOS 16.0 to 18.3 when the payload lacks one; the
+    /// signing worker refuses an empty id, so it is no id.
+    static func normalizedAppTransactionID(_ id: String) -> String? { id.isEmpty ? nil : id }
+
+    /// `AppTransaction.shared` on iOS 16 / macOS 13, verified; the receipt when it throws (offline with nothing
+    /// cached) and on iOS 15. An unverified answer is nil: the receipt never overrides a StoreKit answer. Never
+    /// refreshes either: both can prompt for an Apple ID password.
     @concurrent
     public func appTransaction() async throws -> AppTransactionSnapshot? {
         if #available(iOS 16.0, macOS 13.0, *) {
-            if let result = try? await AppTransaction.shared, case .verified(let app) = result {
-                var appTransactionID: String?
-                if #available(iOS 18.4, macOS 15.4, *) { appTransactionID = app.appTransactionID }
-                return AppTransactionSnapshot(
-                    bundleID: app.bundleID,
-                    originalAppVersion: app.originalAppVersion,
-                    originalPurchaseDate: app.originalPurchaseDate,
-                    environment: Self.map(app.environment),
-                    appTransactionID: appTransactionID,
-                    origin: .appTransaction,
-                    signedPayload: Data(result.jwsRepresentation.utf8))
+            let answer: AppTransactionAnswer
+            do {
+                let result = try await AppTransaction.shared
+                if case .verified(let app) = result {
+                    return AppTransactionSnapshot(
+                        bundleID: app.bundleID,
+                        originalAppVersion: app.originalAppVersion,
+                        originalPurchaseDate: app.originalPurchaseDate,
+                        environment: Self.map(app.environment),
+                        // Declared for iOS 16 and back-deployed below 18.4, where it reads the payload's own id.
+                        appTransactionID: Self.normalizedAppTransactionID(app.appTransactionID),
+                        origin: .appTransaction,
+                        signedPayload: Data(result.jwsRepresentation.utf8))
+                }
+                answer = .unverified
+            } catch {
+                answer = .failed
             }
+            guard Self.usesReceipt(after: answer) else { return nil }
         }
-        return try receipt.snapshot()
+        return try await receipt.snapshot()
     }
 
     @concurrent
@@ -155,6 +175,16 @@ public struct StoreKit2Client: StoreClient {
         return nil
     }
 
+    /// The end of the group's billing grace period, from the verified renewal info of a status in grace; nil when the
+    /// group is not in grace. Read by the engine only when `currentEntitlements` lists a lapsed subscription.
+    @concurrent
+    public func renewalGraceEnd(groupID: String) async throws -> Date? {
+        for status in try await Product.SubscriptionInfo.status(for: groupID) where status.state == .inGracePeriod {
+            if case .verified(let info) = status.renewalInfo { return info.gracePeriodExpirationDate }
+        }
+        return nil
+    }
+
     @concurrent
     public func isEligibleForIntroOffer(groupID: String) async -> Bool {
         await Product.SubscriptionInfo.isEligibleForIntroOffer(for: groupID)
@@ -179,11 +209,28 @@ public struct StoreKit2Client: StoreClient {
             expirationDate: transaction.expirationDate,
             revocationDate: transaction.revocationDate,
             isUpgraded: transaction.isUpgraded,
-            isIntroductoryOffer: transaction.offerType == .introductory,
+            isIntroductoryOffer: isIntroductoryFreeTrial(transaction),
             // A transaction does not carry the renewal preference; `subscriptionPhase` reads it on demand.
             willAutoRenew: true,
             subscriptionGroupID: transaction.subscriptionGroupID,
             ownership: transaction.ownershipType == .familyShared ? .familyShared : .purchased)
+    }
+
+    /// The transaction redeemed the introductory offer as a free trial: the offer type and its payment mode together.
+    /// A paid introductory offer (pay as you go, pay up front) is a paying period, and a free promotional, offer-code
+    /// or win-back period is not the introductory trial.
+    static func isIntroductoryFreeTrial(_ transaction: Transaction) -> Bool {
+        if #available(iOS 17.2, macOS 14.2, *) {
+            return transaction.offer?.type == .introductory && transaction.offer?.paymentMode == .freeTrial
+        }
+        // Both back-deployed to iOS 15: the payment mode is the signed transaction's own `offerDiscountType`.
+        return isIntroductoryFreeTrial(offerType: transaction.offerType, paymentModeRawValue: transaction.offerPaymentModeStringRepresentation)
+    }
+
+    /// The pure decision, over the raw values the SDK reads on every OS version (`FREE_TRIAL`, `PAY_AS_YOU_GO`,
+    /// `PAY_UP_FRONT`).
+    static func isIntroductoryFreeTrial(offerType: Transaction.OfferType?, paymentModeRawValue: String?) -> Bool {
+        offerType == .introductory && paymentModeRawValue == "FREE_TRIAL"
     }
 
     @available(iOS 16.0, macOS 13.0, *)

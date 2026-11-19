@@ -10,16 +10,23 @@
 #     itself over every *.xctest the build produced, because the JSON at `swift test --show-codecov-path`
 #     does not always include every test bundle.
 #   * `xcrun xccov view --report --json <bundle>.xcresult` from `xcodebuild test -enableCodeCoverage YES`
-#     (the simulator lane for PaywallKit, PaywallSimulator and PaywallCloudSync). Lines only.
+#     (the simulator lane for PaywallKit, PaywallSimulator and PaywallCloudSync). Lines only: a target with no
+#     region data reads `n/a`, and fails against a baseline that has a regions number for it.
 #
 # Usage:
 #   swift test --enable-code-coverage
 #   Scripts/coverage-gate.sh [--targets "PaywallCore PaywallTesting"] [--xccov report.json]...
 #                            [--baseline coverage-baseline.json] [--write-baseline coverage-baseline.json]
-#   --write-baseline rewrites the file only when the gate passes, so a failed run never lowers the ratchet.
-#                            [--threshold 97]
+#                            [--retire <target>]... [--threshold 97]
 #
-# Exit status: 0 when every requested target passes, 1 otherwise. No exclusions.
+#   Without --targets the expected set is the union of the targets measured and the targets in the baseline
+#   (and in the file being written), so a target that vanished from the run fails as "missing" instead of
+#   disappearing. --retire removes a renamed or deleted target from that union and from the written file.
+#   --baseline must exist, unless it is the file --write-baseline is about to create (a bootstrap).
+#   --write-baseline merges this run's targets into the file (other targets keep their numbers), ratchets against
+#   the file's own numbers as well, and writes only when the gate passes, so a failed run never lowers the ratchet.
+#
+# Exit status: 0 when every requested target passes, 1 otherwise, 2 for a usage or setup problem. No exclusions.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -29,6 +36,7 @@ TARGETS=""
 XCCOV=()
 BASELINE=""
 WRITE_BASELINE=""
+RETIRE=""
 
 # Crash-critical files: 100 % line and 100 % region. Keep in sync with the design's crash-safety section.
 CRITICAL=(
@@ -48,10 +56,18 @@ while [[ $# -gt 0 ]]; do
     --xccov) XCCOV+=("$2"); shift 2 ;;
     --baseline) BASELINE="$2"; shift 2 ;;
     --write-baseline) WRITE_BASELINE="$2"; shift 2 ;;
-    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+    --retire) RETIRE="$RETIRE $2"; shift 2 ;;
+    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "coverage-gate: unknown argument $1" >&2; exit 2 ;;
   esac
 done
+
+if [[ -n "$BASELINE" && ! -f "$BASELINE" ]]; then
+  if [[ -z "$WRITE_BASELINE" || "$(cd "$(dirname "$BASELINE")" 2>/dev/null && pwd -P)/$(basename "$BASELINE")" != "$(cd "$(dirname "$WRITE_BASELINE")" 2>/dev/null && pwd -P)/$(basename "$WRITE_BASELINE")" ]]; then
+    echo "coverage-gate: baseline $BASELINE does not exist (pass the same path as --write-baseline to create it)" >&2
+    exit 2
+  fi
+fi
 
 if [[ "$(uname)" == "Darwin" ]]; then LLVM_COV=(xcrun llvm-cov); else LLVM_COV=(llvm-cov); fi
 
@@ -86,15 +102,18 @@ for object in "${OBJECTS[@]:1}"; do ARGS+=(-object "$object"); done
 "${LLVM_COV[@]}" export -summary-only -instr-profile "$PROFDATA" "${ARGS[@]}" \
   -ignore-filename-regex '(\.build|/Tests/|/checkouts/)' > "$WORK/llvm.json"
 
-python3 - "$WORK/llvm.json" "$THRESHOLD" "$TARGETS" "$BASELINE" "$WRITE_BASELINE" "$(pwd)" \
+python3 - "$WORK/llvm.json" "$THRESHOLD" "$TARGETS" "$BASELINE" "$WRITE_BASELINE" "$RETIRE" "$(pwd)" \
   "${#CRITICAL[@]}" "${CRITICAL[@]}" "${XCCOV[@]+"${XCCOV[@]}"}" <<'PY'
 import json, os, sys
 
-llvm_path, threshold, targets_arg, baseline_path, write_baseline, root, n_critical = sys.argv[1:8]
-critical = sys.argv[8:8 + int(n_critical)]
-xccov_paths = sys.argv[8 + int(n_critical):]
+llvm_path, threshold, targets_arg, baseline_path, write_baseline, retire_arg, root, n_critical = sys.argv[1:9]
+critical = sys.argv[9:9 + int(n_critical)]
+xccov_paths = sys.argv[9 + int(n_critical):]
 threshold = float(threshold)
 root = os.path.realpath(root)
+retired = set(retire_arg.split())
+explicit = bool(targets_arg.strip())
+EPSILON = 1e-6
 
 def relative(path):
     path = os.path.realpath(path)
@@ -126,15 +145,25 @@ for path in xccov_paths:
         for f in target.get("files", []):
             offer(f["path"], (f["coveredLines"], f["executableLines"]), None)
 
+# Per target: lines always; regions only from files that reported them (None otherwise, never a free 100 %).
 by_target = {}
 for rel, data in files.items():
     target = rel.split("/")[1]
-    t = by_target.setdefault(target, {"lines": [0, 0], "regions": [0, 0]})
+    t = by_target.setdefault(target, {"lines": [0, 0], "regions": None})
     t["lines"][0] += data["lines"][0]; t["lines"][1] += data["lines"][1]
     if data["regions"]:
+        if t["regions"] is None:
+            t["regions"] = [0, 0]
         t["regions"][0] += data["regions"][0]; t["regions"][1] += data["regions"][1]
 
-requested = targets_arg.split() if targets_arg.strip() else sorted(by_target)
+baseline = json.load(open(baseline_path)) if baseline_path and os.path.exists(baseline_path) else {}
+written = json.load(open(write_baseline)) if write_baseline and os.path.exists(write_baseline) else {}
+
+if explicit:
+    requested = targets_arg.split()
+else:
+    requested = sorted((set(by_target) | set(baseline) | set(written)) - retired)
+
 pct = lambda pair: 100.0 * pair[0] / pair[1] if pair[1] else 100.0
 failed = False
 
@@ -146,11 +175,13 @@ for target in requested:
         print(f"{target:<20} {'missing':>9}            FAIL: no coverage data for this target")
         failed = True
         continue
-    lines, regions = pct(t["lines"]), pct(t["regions"])
-    summary[target] = {"lines": round(lines, 2), "regions": round(regions, 2)}
-    ok = lines + 1e-9 >= threshold
+    lines = pct(t["lines"])
+    regions = pct(t["regions"]) if t["regions"] is not None else None
+    summary[target] = {"lines": round(lines, 2), "regions": round(regions, 2) if regions is not None else None}
+    ok = lines + EPSILON >= threshold
     failed |= not ok
-    print(f"{target:<20} {lines:>8.2f}% {regions:>8.2f}%   {'ok' if ok else 'FAIL'}")
+    shown = f"{regions:>8.2f}%" if regions is not None else f"{'n/a':>9}"
+    print(f"{target:<20} {lines:>8.2f}% {shown}   {'ok' if ok else 'FAIL'}")
     if not ok:
         worst = sorted(((pct(d['lines']), rel, d['lines']) for rel, d in files.items()
                         if rel.split('/')[1] == target and d['lines'][0] < d['lines'][1]))[:8]
@@ -160,7 +191,7 @@ for target in requested:
 print("\ncrash-critical files (100 % lines and regions):")
 for rel in critical:
     target = rel.split("/")[1]
-    if requested and target not in requested:
+    if explicit and target not in requested:
         continue
     d = files.get(rel)
     if d is None:
@@ -171,22 +202,38 @@ for rel in critical:
     shown = f"{regions:.2f}%" if regions is not None else "n/a"
     print(f"  {rel}: lines {lines:.2f}% regions {shown}  {'ok' if ok else 'FAIL'}")
 
-if baseline_path and os.path.exists(baseline_path):
-    baseline = json.load(open(baseline_path))
-    print("\nratchet against", baseline_path)
+def ratchet(label, before_all):
+    global failed
+    print("\nratchet against", label)
     for target, numbers in summary.items():
-        before = baseline.get(target)
+        before = before_all.get(target)
         if not before:
             continue
         for kind in ("lines", "regions"):
-            if numbers[kind] + 0.01 < before[kind]:
-                print(f"  {target} {kind}: {numbers[kind]:.2f}% < baseline {before[kind]:.2f}%  FAIL")
+            floor = before.get(kind)
+            if floor is None:
+                continue
+            now = numbers[kind]
+            if now is None:
+                print(f"  {target} {kind}: n/a < baseline {floor:.2f}%  FAIL (this run has no {kind} data for it)")
+                failed = True
+            elif now + EPSILON < floor:
+                print(f"  {target} {kind}: {now:.2f}% < baseline {floor:.2f}%  FAIL")
                 failed = True
 
-# A ratchet never writes itself down: a failed run leaves the baseline alone.
+if baseline:
+    ratchet(baseline_path, baseline)
+if written and os.path.realpath(write_baseline) != os.path.realpath(baseline_path or ""):
+    ratchet(write_baseline, written)
+
+# A ratchet never writes itself down: a failed run leaves the file alone. A passing run merges its targets in.
 if write_baseline and not failed:
+    merged = dict(written)
+    for key in retired:
+        merged.pop(key, None)
+    merged.update(summary)
     with open(write_baseline, "w") as out:
-        json.dump(summary, out, indent=2, sort_keys=True)
+        json.dump(merged, out, indent=2, sort_keys=True)
         out.write("\n")
 
 print("\ncoverage gate:", "FAILED" if failed else "passed")

@@ -31,6 +31,23 @@ jobs:
             echo "::error::warnings-as-errors belongs on the command line, never in the manifest"
             exit 1
           fi
+      # O1: no private key ever enters the tree. `.p8` files are gitignored; a tracked one, or PEM key material
+      # (a BEGIN PRIVATE KEY header followed by its base64 body) anywhere but the worker's local dev-vars example,
+      # fails the job. The StoreKit fixture's test key is base64 in JSON, not a PEM.
+      - name: Reject private key material
+        run: |
+          if git ls-files -z | tr '\0' '\n' | grep -E '\.p8$'; then
+            echo "::error::a .p8 private key is tracked"
+            exit 1
+          fi
+          if git ls-files -z | xargs -0 grep -lzP -- '-----BEGIN (EC |ENCRYPTED )?PRIVATE KEY-----\s*\n[A-Za-z0-9+/=]{40,}' \
+             | grep -v '^Workers/PromotionalOfferSigner/.dev.vars.example$'; then
+            echo "::error::private key material in a tracked file (keys live in Worker secrets and outside the checkout)"
+            exit 1
+          fi
+      # B7: the coverage gate's own logic, over stubbed toolchain commands, before any lane trusts it.
+      - name: Coverage gate self-test
+        run: Scripts/coverage-gate-selftest.sh
 
   # One job holds every coverage source, because the gate is per target and PaywallKit's StoreKit adapter is only
   # exercised in the hosted simulator lane: `swift test` (llvm-cov) plus two `xcodebuild test` runs (xccov).
@@ -75,8 +92,11 @@ jobs:
             --xccov "$RUNNER_TEMP/package-xccov.json" --xccov "$RUNNER_TEMP/host-xccov.json"
       - name: Release build
         run: swift build -c release -Xswiftc -warnings-as-errors
-      - name: release_archive_has_no_simulator_symbols
-        run: Scripts/check-release-symbols.sh
+      # B3: the classifiers over fixture listings first, so a check that cannot see a leak never passes a build.
+      - name: release_archive_has_no_simulator_symbols (self-test, then the release objects)
+        run: |
+          Scripts/check-release-symbols.sh --self-test
+          Scripts/check-release-symbols.sh
       - name: Keep the xcresult bundles
         if: always()
         uses: actions/upload-artifact@v4
@@ -130,5 +150,7 @@ jobs:
         run: Scripts/coverage-gate.sh --targets "PaywallCore PaywallTesting"
       - name: Test under TSan
         run: swift test --sanitize=thread
-      - name: release_archive_has_no_simulator_symbols
-        run: Scripts/check-release-symbols.sh
+      - name: release_archive_has_no_simulator_symbols (self-test, then the release objects)
+        run: |
+          Scripts/check-release-symbols.sh --self-test
+          Scripts/check-release-symbols.sh

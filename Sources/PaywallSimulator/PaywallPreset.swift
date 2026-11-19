@@ -8,6 +8,7 @@
         case free, trial, weekly, monthly, yearly, lifetime, grandfathered
         case tokens5 = "tokens-5"
         case broke, offline
+        /// StoreKit never answers and there is no network: the launch resolution never lands, gates fail closed.
         case storeDown = "store-down"
 
         /// One exhaustive switch: a new case does not compile until it says what it simulates.
@@ -62,7 +63,9 @@
         public var entitlement: Entitlement = .free
         /// The ledger balance.
         public var tokens = 0
-        /// `false`: resolution fails and, without a snapshot, gates answer `entitlementUnavailable`.
+        /// `false`: StoreKit never answers the launch resolution, the one failure its passive reads can show (they
+        /// never throw). `start()` waits on it, the entitlement stays `.unknown`, so `.paid` and token gates answer
+        /// `entitlementUnavailable` and nothing is published; flipping it back lets the resolution land.
         public var storeReachable = true
         /// `false`: `products()` fails (cached prices, buy disabled) and the outbox stays queued.
         public var network = true

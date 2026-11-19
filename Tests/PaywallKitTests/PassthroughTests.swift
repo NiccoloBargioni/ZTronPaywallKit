@@ -19,6 +19,7 @@ struct PassthroughTests {
         let store = FakeStore(products: products)
         let directory = makeTemporaryPaywallDirectory()
         var configuration = Paywall.Configuration(catalog: catalog)
+        configuration.fileKeyStore = InMemoryFileKeyStore()
         configuration.passthrough = true
         configuration.store = store
         configuration.storageDirectory = directory
@@ -109,6 +110,7 @@ struct PassthroughTests {
         #expect(paywall.isPassthrough)
         // Live: the same free user with an empty wallet is denied.
         var live = Paywall.Configuration(catalog: catalog)
+        live.fileKeyStore = InMemoryFileKeyStore()
         live.store = store
         live.storageDirectory = directory
         live.includesDefaultAudit = false
@@ -127,6 +129,69 @@ struct PassthroughTests {
         #expect(paywall.engine == nil)
         #expect(paywall.evaluate(.paid, id: "pro").value != nil)
         #expect(paywall.entitlement == .unknown)
+    }
+
+    private func live(_ store: FakeStore, _ directory: URL) -> Paywall.Configuration {
+        var live = Paywall.Configuration(catalog: catalog)
+        live.fileKeyStore = InMemoryFileKeyStore()
+        live.store = store
+        live.clock = FakeClock()
+        live.storageDirectory = directory
+        live.includesDefaultAudit = false
+        live.connectivity = nil
+        live.welcomeTokens = 0
+        return live
+    }
+
+    /// A8: a `.paywallGated` view on screen is decided again when the facade leaves passthrough: the view that was
+    /// open for free is now denied, and told, and the engine knows it.
+    @Test func flipping_passthrough_off_re_evaluates_gated_views_on_screen() async throws {
+        let (paywall, store, directory) = makePassthrough()
+        let holder = UUID()
+        var changes: [GateSessionState] = []
+        let first = paywall.openSession(holder: holder, level: .paid, policy: .reserve, source: gate, scope: nil) { changes.append($0) }
+        #expect(first.decision == .open(.free))
+        paywall.configure(live(store, directory))
+        await paywall.waitUntilStarted()
+        let denied = try #require(changes.last)
+        #expect(!denied.isOpen && denied.failure?.reason == .requiresPaid)
+        #expect(paywall.engine?.sessionState(holder)?.isOpen == false, "the engine knows the view")
+        paywall.closeSession(holder: holder)
+        #expect(paywall.engine?.sessionState(holder) == nil && paywall.liveSessions[holder] == nil)
+    }
+
+    /// A8: the same flip for a view that draws on appear: it is decided once on the new engine, so it draws once.
+    @Test func flipping_passthrough_off_draws_once_for_a_deductNow_view() async throws {
+        let (paywall, store, directory) = makePassthrough()
+        let holder = UUID()
+        var changes: [GateSessionState] = []
+        _ = paywall.openSession(holder: holder, level: .tokens(1), policy: .deductNow, source: gate, scope: nil) { changes.append($0) }
+        var published: [PaywallEvent] = []
+        let subscription = paywall.events.sink { published.append($0) }
+        var configuration = live(store, directory)
+        configuration.welcomeTokens = 1
+        paywall.configure(configuration)
+        await paywall.waitUntilStarted()
+        #expect(changes.last?.decision == .open(.drawn(1)))
+        #expect(paywall.wallet.balance == 0)
+        #expect(published.filter { if case .tokensConsumed = $0 { true } else { false } }.count == 1)
+        subscription.cancel()
+    }
+
+    /// A8: the other direction: a denied view opens for free the moment passthrough comes on.
+    @Test func flipping_passthrough_on_opens_denied_views() async throws {
+        let (paywall, _, _) = await makePaywall()
+        let holder = UUID()
+        var changes: [GateSessionState] = []
+        let denied = paywall.openSession(holder: holder, level: .paid, policy: .reserve, source: gate, scope: nil) { changes.append($0) }
+        #expect(denied.failure?.reason == .requiresPaid)
+        var off = try #require(paywall.configuration)
+        off.passthrough = true
+        paywall.configure(off)
+        #expect(changes.last?.decision == .open(.free))
+        #expect(paywall.liveSessions[holder]?.state.isOpen == true)
+        paywall.closeSession(holder: holder)
+        #expect(paywall.liveSessions[holder] == nil)
     }
 
     @Test func an_invalid_catalog_is_logged_but_still_passes_through() {

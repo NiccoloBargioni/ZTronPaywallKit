@@ -46,8 +46,8 @@ export async function importPublicJWK(jwk: JsonWebKey): Promise<CryptoKey> {
   return crypto.subtle.importKey("jwk", jwk, { name: "ECDSA", namedCurve: "P-256" }, true, ["verify"]);
 }
 
-/** Secrets to replace, or remove with `undefined`. */
-export type EnvOverrides = Partial<Record<keyof Env, string | undefined>>;
+/** Secrets (and the optional binding) to replace, or remove with `undefined`. */
+export type EnvOverrides = { [K in keyof Env]?: Env[K] | undefined };
 
 /** A complete environment on a fresh throwaway key; `overrides` replace or (with `undefined`) remove secrets. */
 export async function testEnv(overrides: EnvOverrides = {}): Promise<{ env: Env; key: TestKey }> {
@@ -58,9 +58,9 @@ export async function testEnv(overrides: EnvOverrides = {}): Promise<{ env: Env;
     APPLE_IAP_ISSUER_ID: TEST_ISSUER_ID,
     APPLE_BUNDLE_IDS: "com.example.app, com.example.app.beta",
   };
-  for (const [name, value] of Object.entries(overrides) as [keyof Env, string | undefined][]) {
+  for (const [name, value] of Object.entries(overrides) as [keyof Env, Env[keyof Env] | undefined][]) {
     if (value === undefined) delete env[name];
-    else env[name] = value;
+    else (env as Record<string, unknown>)[name] = value;
   }
   return { env, key };
 }

@@ -34,7 +34,8 @@ public enum Entitlement: Hashable, Codable, Sendable {
         expiresAt: Date? = nil,
         willAutoRenew: Bool = true,
         phase: SubscriptionPhase = .active,
-        isFamilyShared: Bool = false
+        isFamilyShared: Bool = false,
+        gracePeriodEndsAt: Date? = nil
     ) -> Entitlement {
         .subscribed(
             Subscription(
@@ -44,7 +45,8 @@ public enum Entitlement: Hashable, Codable, Sendable {
                 willAutoRenew: willAutoRenew,
                 isTrial: isTrial,
                 phase: phase,
-                isFamilyShared: isFamilyShared
+                isFamilyShared: isFamilyShared,
+                gracePeriodEndsAt: gracePeriodEndsAt
             ))
     }
 }
@@ -125,7 +127,8 @@ extension Entitlement {
     }
 }
 
-/// Renewal state. Read from `Product.SubscriptionInfo.Status` only when the account screen asks for it.
+/// Renewal state. `.inGracePeriod` is set by the resolver when StoreKit lists a lapsed subscription inside a billing
+/// grace period; the account screen reads the full state from `Paywall.subscriptionPhase()`, which goes to the App Store.
 public enum SubscriptionPhase: String, Hashable, Codable, Sendable {
     case active
     case inGracePeriod
@@ -135,14 +138,22 @@ public enum SubscriptionPhase: String, Hashable, Codable, Sendable {
 public struct Subscription: Hashable, Codable, Sendable {
     public var productID: String
     public var tier: SubscriptionTier
+    /// The transaction's expiration: the failed renewal date while in a billing grace period, when `gracePeriodEndsAt`
+    /// is the end that counts.
     public var expiresAt: Date?
     /// A transaction does not say whether it will renew; `StoreKit2Client` reports `true` and the account screen
     /// reads the renewal state from `Paywall.subscriptionPhase()`, which goes to the App Store.
     public var willAutoRenew: Bool
+    /// The subscription is in its introductory free trial. A paid introductory offer is not a trial.
     public var isTrial: Bool
     public var phase: SubscriptionPhase
     /// Bought by another family member and shared. Only the purchaser can manage it in Settings.
     public var isFamilyShared: Bool
+    /// While `phase` is `.inGracePeriod`: when the grace ends and access with it, unless billing recovers first.
+    public var gracePeriodEndsAt: Date?
+
+    /// The moment access lapses: the grace end during a billing grace period, the expiration otherwise.
+    public var accessEndsAt: Date? { gracePeriodEndsAt ?? expiresAt }
 
     public init(
         productID: String,
@@ -151,7 +162,8 @@ public struct Subscription: Hashable, Codable, Sendable {
         willAutoRenew: Bool = true,
         isTrial: Bool = false,
         phase: SubscriptionPhase = .active,
-        isFamilyShared: Bool = false
+        isFamilyShared: Bool = false,
+        gracePeriodEndsAt: Date? = nil
     ) {
         self.productID = productID
         self.tier = tier
@@ -160,13 +172,15 @@ public struct Subscription: Hashable, Codable, Sendable {
         self.isTrial = isTrial
         self.phase = phase
         self.isFamilyShared = isFamilyShared
+        self.gracePeriodEndsAt = gracePeriodEndsAt
     }
 
     private enum CodingKeys: String, CodingKey {
-        case productID, tier, expiresAt, willAutoRenew, isTrial, phase, isFamilyShared
+        case productID, tier, expiresAt, willAutoRenew, isTrial, phase, isFamilyShared, gracePeriodEndsAt
     }
 
-    /// Snapshots written before `isFamilyShared` existed decode as the purchaser's own.
+    /// Snapshots written before `isFamilyShared` or `gracePeriodEndsAt` existed decode as the purchaser's own, with
+    /// no grace period.
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         productID = try container.decode(String.self, forKey: .productID)
@@ -176,6 +190,7 @@ public struct Subscription: Hashable, Codable, Sendable {
         isTrial = try container.decode(Bool.self, forKey: .isTrial)
         phase = try container.decode(SubscriptionPhase.self, forKey: .phase)
         isFamilyShared = try container.decodeIfPresent(Bool.self, forKey: .isFamilyShared) ?? false
+        gracePeriodEndsAt = try container.decodeIfPresent(Date.self, forKey: .gracePeriodEndsAt)
     }
 }
 

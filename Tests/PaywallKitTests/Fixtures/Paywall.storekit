@@ -122,6 +122,12 @@
           "familyShareable" : true,
           "groupNumber" : 1,
           "internalID" : "6400000012",
+          "introductoryOffer" : {
+            "displayPrice" : "14.99",
+            "internalID" : "6400000021",
+            "paymentMode" : "payUpFront",
+            "subscriptionPeriod" : "P1Y"
+          },
           "localizations" : [
             {
               "description" : "Pro, billed yearly",

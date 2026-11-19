@@ -147,13 +147,90 @@ describe("POST /v1/promotional-offers/sign", () => {
     expect(await form.json()).toEqual({ error: "unsupported_media_type" });
   });
 
-  it("refuses oversized bodies, declared or actual", async () => {
+  it("refuses oversized bodies, declared or actual, counted in bytes, and stops reading past the limit", async () => {
     const { env } = await testEnv();
     const declared = await handleRequest(signRequest(validBody, { headers: { "content-length": String(MAX_BODY_BYTES + 1) } }), env);
     expect(declared.status).toBe(413);
     expect(await declared.json()).toEqual({ error: "payload_too_large" });
     const actual = await handleRequest(signRequest({ ...validBody, padding: "x".repeat(MAX_BODY_BYTES) }), env);
     expect(actual.status).toBe(413);
+    // B5: two-byte characters count as bytes, not as UTF-16 code units.
+    const twoByte = await handleRequest(signRequest({ ...validBody, padding: "é".repeat(2049) }), env);
+    expect(twoByte.status).toBe(413);
+    // B5: a streamed body with no content-length is cut off past the limit: at most the limit plus one chunk is read.
+    let pulled = 0;
+    const chunk = new Uint8Array(1024).fill(0x20);
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulled += 1;
+        if (pulled > 1024) controller.close();
+        else controller.enqueue(chunk);
+      },
+    });
+    const streamed = new Request(SIGN_URL, { method: "POST", headers: { "content-type": "application/json" }, body: stream, duplex: "half" } as RequestInit);
+    expect((await handleRequest(streamed, env)).status).toBe(413);
+    expect(pulled).toBeLessThanOrEqual(MAX_BODY_BYTES / 1024 + 2);
+    // A body that fits still signs.
+    expect((await handleRequest(signRequest(validBody), env)).status).toBe(200);
+  });
+
+  it("is 400 for a body that is not UTF-8, and for no body at all", async () => {
+    const { env } = await testEnv();
+    const invalid = new Request(SIGN_URL, { method: "POST", headers: { "content-type": "application/json" }, body: new Uint8Array([0x7b, 0xff, 0x7d]) });
+    const response = await handleRequest(invalid, env);
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: "invalid_request", detail: ["the body is not UTF-8"] });
+    const empty = await handleRequest(new Request(SIGN_URL, { method: "POST", headers: { "content-type": "application/json" } }), env);
+    expect(empty.status).toBe(400);
+    expect(await empty.json()).toEqual({ error: "invalid_request", detail: ["the body is not JSON"] });
+  });
+
+  it("answers 429 rate_limited per client IP when a RATE_LIMITER is bound, before reading the body", async () => {
+    const counts: Record<string, number> = {};
+    const limiter = { limit: async ({ key }: { key: string }) => ({ success: (counts[key] = (counts[key] ?? 0) + 1) <= 3 }) };
+    const { env } = await testEnv({ RATE_LIMITER: limiter });
+    const from = (ip: string, extra: Record<string, string> = {}) => signRequest(validBody, { headers: { "cf-connecting-ip": ip, ...extra } });
+    const statuses: number[] = [];
+    for (let i = 0; i < 4; i++) statuses.push((await handleRequest(from("203.0.113.7"), env)).status);
+    expect(statuses).toEqual([200, 200, 200, 429]);
+    const refused = await handleRequest(from("203.0.113.7"), env);
+    expect(refused.status).toBe(429);
+    expect(await refused.json()).toEqual({ error: "rate_limited" });
+    expect(refused.headers.get("retry-after")).toBe("60");
+    expect(refused.headers.get("cache-control")).toBe("no-store");
+    expect((await handleRequest(from("198.51.100.9"), env)).status).toBe(200);
+    expect(counts).toEqual({ "203.0.113.7": 5, "198.51.100.9": 1 });
+    // A refused request does not read the body: the stream hands its bytes on the first pull and closes on the second,
+    // so a worker that read it to the end pulls twice (the control from another address does), and Node's Request
+    // may pre-read one chunk on its own.
+    const streamed = (ip: string, counter: { pulled: number }) =>
+      new Request(SIGN_URL, {
+        method: "POST",
+        headers: { "content-type": "application/json", "cf-connecting-ip": ip },
+        body: new ReadableStream<Uint8Array>({
+          pull(controller) {
+            counter.pulled += 1;
+            if (counter.pulled === 1) controller.enqueue(new TextEncoder().encode(JSON.stringify(validBody)));
+            else controller.close();
+          },
+        }),
+        duplex: "half",
+      } as RequestInit);
+    const refusedPulls = { pulled: 0 };
+    expect((await handleRequest(streamed("203.0.113.7", refusedPulls), env)).status).toBe(429);
+    expect(refusedPulls.pulled).toBeLessThanOrEqual(1);
+    const controlPulls = { pulled: 0 };
+    expect((await handleRequest(streamed("192.0.2.4", controlPulls), env)).status).toBe(200);
+    expect(controlPulls.pulled).toBe(2);
+    // No client address at all shares one key.
+    expect((await handleRequest(signRequest(validBody), env)).status).toBe(200);
+    expect(counts.unknown).toBe(1);
+  });
+
+  it("signs without a RATE_LIMITER binding, with no limit of its own", async () => {
+    const { env } = await testEnv();
+    expect(env.RATE_LIMITER).toBeUndefined();
+    for (let i = 0; i < 5; i++) expect((await handleRequest(signRequest(validBody), env)).status).toBe(200);
   });
 
   it("validates the request before touching the configuration, and is 500 misconfigured after", async () => {

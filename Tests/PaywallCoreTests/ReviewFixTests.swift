@@ -121,14 +121,17 @@ struct ReviewFixTests {
         await h.engine.syncNow()
         #expect(h.engine.wallet.balance == 7)
         #expect(h.engine.baseline != nil)
-        // Another account's events are not an answer for this one.
-        h.engine.merge([
+        // Another account's events are not an answer for this one: merged, but the baseline stands.
+        #expect(h.engine.merge([
             LedgerEvent(
                 id: "grant:them", at: h.clock.now, deviceID: "B", accountKey: "someone-else", source: nil,
                 previousHash: paywallGenesisHash, kind: .grant(tokens: 50, reason: "theirs"))
-        ])
-        h.engine.settleBaseline(afterPulling: h.engine.ledger.events)
+        ]))
+        #expect(h.engine.baseline != nil)
         #expect(h.engine.wallet.balance == 7)
+        // The journal holds the adopted baseline: a relaunch stands on it too, before any pull.
+        let relaunched = try await h.relaunch(start: false)
+        #expect(relaunched.baseline != nil && relaunched.wallet.balance == 7)
     }
 
     /// Two devices on one Apple Account. B spends one token, uploads the debit, and its Keychain snapshot (9, last
@@ -198,21 +201,33 @@ struct ReviewFixTests {
         #expect(await eventually { await sync.cloud.events.count == 2 })
     }
 
+    /// A5: `shutdown()` is a hard stop. Nothing durable happens on the dead engine afterwards (no grant, no draw, no
+    /// audit record, no sync, no `finish`), and its journal is closed so a successor owns the directory alone.
     @Test func a_shut_down_engine_starts_no_more_background_work() async throws {
         let sync = InMemoryLedgerSync()
         let h = try await Harness.free(tokens: 1, sync: sync)
         await h.engine.syncNow()
         let before = await sync.cloud.pushCount
-        h.engine.shutdown()
-        #expect(h.engine.isShutDown)
-        h.engine.grant(tokens: 1, reason: "late")  // still journaled: the draw path is not what shutdown stops
-        await h.engine.syncNow()
+        let old = h.engine
+        old.shutdown()
+        #expect(old.isShutDown && old.journal.isClosed)
+        let events = h.events.count
+        #expect(!old.grant(tokens: 1, reason: "late"))
+        #expect(old.run(.tokens(1), source: source("late")) { 1 }.failure?.reason == .storageUnavailable)
+        #expect(!old.canPass(.free))
+        #expect(!old.merge([LedgerEvent(id: "grant:late", at: h.clock.now, deviceID: "B", accountKey: unboundAccountKey, source: nil, previousHash: paywallGenesisHash, kind: .grant(tokens: 1, reason: "r"))]))
+        await old.handle(.tokenPack(id: 77, productID: "tokens.10", purchased: h.clock.now))
+        await old.refresh(cause: .foreground)
+        await old.syncNow()
+        await old.start()  // a no-op
         #expect(await sync.cloud.pushCount == before)
-        #expect(h.engine.journal.pendingUpload.count == 1)
-        await h.engine.start()  // a no-op
-        #expect(h.engine.journal.pendingUpload.count == 1)
-        // The next engine on the directory drains what the shut-down one left.
+        #expect(h.events.count == events, "a dead engine publishes nothing")
+        #expect(await h.store.finished.isEmpty)
+        #expect(old.wallet.balance == 1)
+        // The next engine on the directory sees exactly what was there before the shutdown.
         let next = try await h.relaunch()
+        #expect(next.wallet.balance == 1)
+        #expect(!next.ledger.contains("credit:77") && !next.ledger.contains("grant:late"))
         await next.syncNow()
         #expect(next.journal.pendingUpload.isEmpty)
     }
@@ -250,7 +265,7 @@ struct ReviewFixTests {
         h.settings.familySharing = .purchaserOnly
         let strictLifetime = try await h.relaunch(start: false)
         #expect(strictLifetime.entitlement == .free)
-        #expect(PaywallFiles(directory: h.directory).entitlementSnapshot(now: now, familySharing: .sharedEntitlements)?.isPaying == true)
+        #expect(PaywallFiles(directory: h.directory, keyStore: h.fileKeyStore).entitlementSnapshot(now: now, familySharing: .sharedEntitlements)?.isPaying == true)
     }
 
     @Test func purchased_entitlements_are_untouched_by_the_policy() {

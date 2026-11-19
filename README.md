@@ -20,13 +20,17 @@ What it guarantees:
   from verified transactions. Nothing in the package can grant a subscription or a lifetime unlock on its own.
 - **Value is never delivered without a durable debit.** A token gate writes the debit to disk before the gated code
   runs; a crash at any step leaves the ledger consistent at the next launch, and a gated body that throws gets its
-  draw reversed.
+  draw reversed. The guarantee is one device's: with a sync carrier each device spends against the balance it last
+  pulled, so the devices of one account can spend the same tokens offline or between pulls; the merge keeps every
+  debit and the balance goes negative until repaid (see Known defects and limitations).
 - **Every decision is on the record.** Each gate decision, purchase, restore and entitlement change is published once
-  as an event and written to an audit log that can be verified and exported.
+  as an event and written to a hash-chained audit log that can be checked for corruption and exported. It is evidence
+  for a support case, not proof against whoever controls the device (see HANDBOOK.md, "Audit").
 - **Nothing secret ships in the app.** Promotional offers are signed by a server (a Cloudflare Worker in this
   repository) that holds the In-App Purchase key; the app holds only its URL. See [Secrets](#secrets).
-- **Debug tooling compiles to nothing in release.** Presets, launch arguments and overrides live in a module that is
-  empty in release builds, and a script fails the build if a shipping module contains any of it.
+- **Debug tooling compiles to nothing in release.** Presets, launch arguments, overrides and the fakes live in two
+  modules that are empty in release builds, and a script fails the release build if a shipping module's symbols name
+  any of it, or if either module defines a Swift symbol.
 
 Platforms: iOS 15 and later, Swift 6 language mode, SwiftUI first with one UIKit bridge. macOS only builds and runs the
 unit tests; Linux builds the engine and the fakes. Products and the modules they import:
@@ -138,7 +142,7 @@ come with `ZTronPaywallKit`; the value types they take and return are declared i
 |---|---|---|
 | `GateLevel` | What a gate asks: `.free`, `.paid`, `.tokens(n)`. | The first argument of every gate. |
 | `withPaywall(_:id:_:)` (sync and async) | Runs a body behind a gate. Draws the tokens durably before the body, refunds them if the body throws, publishes a `PaywallFailure` when closed. Returns `PaywallOutcome`, whose `.blocked` is a value; `.get()` for the throwing style. | After configuring. Pair with `.paywallSheet` so a denial shows the screen. |
-| `.paywallGated(_:policy:id:)`, `.paywallGated(_:denied:)` | Gates a view. `policy: .reserve` (default) holds the tokens and spends only when something inside commits; `.deductNow` draws on appear. A refund or expiry while on screen flips the view live. | Under `.paywallProvider`. Pass a stable `id` when the lease must survive a view rebuild. |
+| `.paywallGated(_:policy:id:)`, `.paywallGated(_:denied:)` | Gates a view. `policy: .reserve` (default) holds the tokens and spends only when something inside commits; `.deductNow` draws on appear. A refund or expiry while on screen flips the view live. Once the view holds a lease (its first draw or commit, or a live lease found on appear) it pins it while on screen: commits and any `withPaywall` with that id, at any `n`, open `.leased` without drawing, and `tolerance` counts from when the view leaves. A view gate costs `n` per visit; per-use pricing needs a plain `withPaywall` with its own id. | Under `.paywallProvider`. Pass a stable `id` when the lease must survive a view rebuild. |
 | `\.paywallGate`, `GateSession.withPaywall` | Inside gated content: the gate the view lives behind, so a button commits the reservation it holds. | Only inside `.paywallGated` content. |
 | `TokenPolicy`, `LeasePolicy` | How a view gate spends, and whether a lease is fixed from the draw or refreshed on re-entry. | `LeasePolicy` is a configuration value; `TokenPolicy` a per-view argument. |
 | `PaywallOutcome`, `PaywallFailure`, `PaywallSource` | What a gate returns, why it closed (`reason`, the level, the wallet at the time) and where it lives (`id`, file, function, line). | `PaywallFailure.source` goes back into `purchase(_:source:)` so the audit links the buy to the gate. |
@@ -160,26 +164,26 @@ come with `ZTronPaywallKit`; the value types they take and return are declared i
 | API | What it does | Before / after |
 |---|---|---|
 | `Paywall.products()`, `refreshStorefront()`, `PaywallStorefront`, `PaywallProduct` | The catalog as the App Store sells it: prices, periods, offers and eligibility per product. Offline, the last storefront, marked not purchasable. | After configuring; refreshed hourly, on restore, and on demand. Feeds the screen. |
-| `Paywall.purchase(_:source:)` → `PurchaseOutcome` | Buys a product. Pack credits land in the ledger before the transaction is finished; the entitlement updates itself. Handlers chain: `onPurchaseCompleted`, `onPurchasePending` (Ask to Buy), `onPurchaseCancelled`. Store errors are thrown. | From the screen, with the failure's `source`. A purchase does not re-run the gate it was bought for. |
+| `Paywall.purchase(_:source:)` → `PurchaseOutcome` | Buys a product. Pack credits land in the ledger before the transaction is finished; the entitlement updates itself. Handlers chain: `onPurchaseCompleted`, `onPurchasePending` (Ask to Buy, and a pack whose credit could not be written: the transaction stays unfinished and is credited when the write lands, later in the session or at the next launch), `onPurchaseCancelled`. Store errors are thrown. | From the screen, with the failure's `source`. A purchase does not re-run the gate it was bought for. |
 | `Paywall.purchase(_:promotionalOffer:source:)`, `PaywallProduct.Offer` | Buys a subscription with a promotional offer: asks the configured signer for this install's signature, then buys with it. | Needs `configuration.promotionalOfferSigner` and a deployed signer. The offer comes from `PaywallProduct.offers` with kind `.promotional`; introductory offers need nothing. |
-| `RemotePromotionalOfferSigner(endpoint:transport:timeout:)`, `HTTPTransport`, `URLSessionTransport` | The client of the signing worker: posts bundle, product, offer and app transaction id, returns the signed offer. | Deploy `Workers/PromotionalOfferSigner` first; set the client on the configuration. |
+| `RemotePromotionalOfferSigner(endpoint:transport:timeout:)`, `HTTPTransport`, `URLSessionTransport` | The client of the signing worker: posts bundle, product, offer and app transaction id, returns the signed offer within a total deadline (`timeout`, 15 s by default). | Deploy `Workers/PromotionalOfferSigner` first; set the client on the configuration. |
 | `Paywall.restorePurchases()` | The Restore button: syncs with the App Store and re-resolves. The only call that triggers `AppStore.sync()`. | From the screen's Restore button, never automatically. |
 | `Paywall.refresh()`, `didBecomeActive()`, `syncNow()` | Re-resolve now; what the provider does on foreground; push and pull the ledger now. | Usually not needed with the provider installed. |
-| `StoreKit2Client`, `NetworkPathConnectivity`, `ReceiptClient`, `AppleReceiptVerifier` | The production adapters behind the defaults: StoreKit 2, `NWPathMonitor`, and the on-device receipt path used on iOS 15. | Replace through `configuration.store` and `.connectivity` only to substitute them. |
+| `StoreKit2Client`, `NetworkPathConnectivity`, `ReceiptClient`, `AppleReceiptVerifier` | The production adapters behind the defaults: StoreKit 2, `NWPathMonitor`, and the on-device receipt path (iOS 15, and iOS 16 and later only when `AppTransaction.shared` throws), which admits a receipt only for the device it was issued to. | Replace through `configuration.store` and `.connectivity` only to substitute them. |
 
 ### Audit
 
 | API | What it does | Before / after |
 |---|---|---|
 | `PaywallAuditSink`, `AuditRecord`, `ClosureSink`, `JournalSink`, `OSLogSink` | Where the audit goes: your closure (analytics), a rotating JSON-lines file in the paywall directory, the unified log (subsystem `ztron.paywall`). The file and the log are on by default. | Add sinks to `configuration.audit`; `includesDefaultAudit = false` drops the defaults. |
-| `Paywall.verifyAuditChain()`, `exportAudit()` | Checks the hash chains of the audit log and the ledger, and writes an export for support or a dispute. | Any time after configuring. |
+| `Paywall.verifyAuditChain()`, `exportAudit()` | Checks the hash chains of the audit log and the ledger, and writes an export for support or a dispute: hash-chained evidence, not proof against the device's owner. | Any time after configuring. |
 
 ### Cross-device sync (`ZTronPaywallCloudSync`)
 
 | API | What it does | Before / after |
 |---|---|---|
-| `PaywallCloudSync(containerIdentifier:keychain:)` | The recommended carrier: ledger events in the CloudKit private database, merged as a set, plus a Keychain wallet snapshot so a reinstall shows the balance before the first sync. | Set as `configuration.sync` before configuring. Needs the iCloud capability with CloudKit and a container. |
-| `KeychainWalletSnapshotStore(service:account:synchronizable:)` | The snapshot store on its own, if the Keychain item needs another name. | Passed to `PaywallCloudSync`. |
+| `PaywallCloudSync(containerIdentifier:keychain:)` | The recommended carrier: ledger events in the CloudKit private database, merged as a set (the pull position lives in the engine's journal, written with the events it covers), plus a Keychain wallet snapshot so a reinstall shows the balance before the first sync and keeps it, launch after launch, until the account's history arrives. Each device spends against the balance it last pulled: hourly, or when a purchase, a restore or a forwarded silent push requests a pull. | Set as `configuration.sync` before configuring. Needs the iCloud capability with CloudKit and a container. |
+| `KeychainWalletSnapshotStore(service:account:synchronizable:)` | The snapshot store on its own, if the Keychain item needs another name. Per device by default (`synchronizable: false`); an item an earlier build wrote as synchronizable is still read when no local one exists. | Passed to `PaywallCloudSync`. |
 | `LedgerSync`, `CloudDatabase`, `CloudKitDatabase`, `InMemoryCloudDatabase` | The seams: write your own carrier, or run the real merge logic against an in-memory cloud in tests. | Optional. |
 
 ### Simulator (`ZTronPaywallSimulator`, debug builds only)
@@ -219,23 +223,42 @@ public key as a JWKS; `GET /v1/health` answers `{"ok": true}`. Its secrets are `
 
 | Risk | What the package does | What stays with the app |
 |---|---|---|
-| **App Review 3.1.1: unlocking without an in-app purchase.** | StoreKit 2 is the only source of entitlements; no code path grants one. Debug overrides and the simulator compile to nothing in release, and `Scripts/check-release-symbols.sh` fails the build if they leak. | Keep the archive check in your pipeline; never ship a build with `passthrough` on past the freemium launch. |
+| **App Review 3.1.1: unlocking without an in-app purchase.** | StoreKit 2 is the only source of entitlements; no code path grants one. Debug overrides, the simulator and the fakes compile to nothing in release, and `Scripts/check-release-symbols.sh` fails the release build if a shipping module's demangled symbols name any of it, or if `PaywallSimulator` or `PaywallTesting` defines a Swift symbol; it checks every module the platform builds and fails by name on one it cannot. | Keep an archive check of your own in the pipeline (a stripped binary keeps few symbols, so this script's patterns do not transfer to an `.ipa`); never ship a build with `passthrough` on past the freemium launch. |
 | **App Review 3.1.2: subscription disclosures, grandfathering, family sharing.** | `PaywallDisclosure` gathers what 3.1.2(c) requires; `GrandfatheringPolicy` and `FamilySharingPolicy` are applied at every resolution; tests map rejection causes to behaviour. | The screen: showing the disclosure, a Restore button, terms and privacy links, hiding Buy for the current tier. |
 | **Value leaks or double spends around crashes.** | The debit is durable before the gated code runs; a crash at any step is recovered at the next launch; a throwing body refunds its draw. | Gate the paid value itself (`.reserve` content is a shell until something inside commits). |
-| **The signing endpoint is public.** Anyone can obtain an offer signature for an allowed app. | The App Store applies its own eligibility rules on top; the worker signs only configured bundle ids and, with `ALLOWED_OFFERS`, only listed offers; Cloudflare rate limiting bounds volume. | Who is shown an offer is the app's decision. App Attest in front of the worker if that decision must hold against a tampered client. |
-| **The signer is down or slow.** | The purchase with an offer fails before the payment sheet, with the signer's error, after the usual `.purchase(stage: .failed)` event; plain purchases are unaffected; the request has a 15-second timeout. | Offer the regular price when the offer purchase fails. |
-| **The In-App Purchase key is compromised or rotated.** | The key exists only as a Worker secret, imported non-extractable; nothing in the app changes with the key. | Revoke in App Store Connect, `wrangler secret put` the new key and id. |
-| **Device clock manipulation.** | Entitlements come from StoreKit's signed transactions, not from the clock. Token leases outlive their draw by `tolerance` (300 s by default), bounding what a moved clock buys. | Choose `tolerance` and `leasePolicy` for your gates. |
+| **The signing endpoint is public.** Anyone can obtain an offer signature for an allowed app. | The App Store applies its own eligibility rules on top; the worker signs only configured bundle ids and, with `ALLOWED_OFFERS`, only listed offers. Nothing bounds the volume by default: an optional `RATE_LIMITER` binding answers 429 per client IP, and a WAF rule on a custom domain stops excess before the Worker (worker README, "Security model"). On Workers Free a flood exhausts the account-wide daily quota. | Who is shown an offer is the app's decision. App Attest in front of the worker if that decision must hold against a tampered client. |
+| **The signer is down or slow.** | The purchase with an offer fails before the payment sheet, with the signer's error, after the usual `.purchase(stage: .failed)` event; plain purchases are unaffected; the request has a 15-second total deadline (`RemotePromotionalOfferSigner.timeout`), not an idle timer. | Offer the regular price when the offer purchase fails. |
+| **The In-App Purchase key is compromised or rotated.** | The key exists as a Worker secret, imported non-extractable, and in the `.p8` downloaded once from App Store Connect, which stays out of the repository (or is deleted after `wrangler secret put`); nothing in the app changes with the key. | Revoke in App Store Connect, `wrangler secret put` the new key and id. |
+| **Device clock manipulation.** | Entitlements come from StoreKit's signed transactions, but whether they have expired is judged by the device clock: the resolver, the launch snapshot and the expiry timer. A clock set forward shows a subscriber as free; one set back keeps a lapsed cached subscription until the launch resolution. Audit records carry uptime to expose clock changes. Token leases outlive their draw by `tolerance` (300 s by default), bounding what a moved clock buys. | Choose `tolerance` and `leasePolicy` for your gates. |
 | **Offline.** | Entitlements resolve from StoreKit's on-device cache; `products()` returns the last storefront, not purchasable; token gates keep working on the local ledger; synced events queue and drain when a path returns. | Nothing; show the storefront's `priceAsOf` when prices are stale. |
-| **Reinstall and account changes.** | With `ZTronPaywallCloudSync`, the balance survives a delete-and-reinstall through the Keychain snapshot and the cloud; without a carrier the package has no memory beyond StoreKit, so a reinstall grants welcome tokens again. | Decide whether tokens are worth a CloudKit container. |
+| **Reinstall and account changes.** | With `ZTronPaywallCloudSync`, the balance survives a delete-and-reinstall through the Keychain snapshot (per device, adopted into the journal and kept across launches until the account's history arrives) and the cloud; without a carrier the package has no memory beyond StoreKit, so a reinstall grants welcome tokens again. | Decide whether tokens are worth a CloudKit container. |
 | **Refunds and revocations.** | A refunded pack is revoked and its credit reversed; a refunded subscription or a family removal ends the entitlement at the next resolution; the audit links each reversal to what it reverses. | `SKIncludeConsumableInAppPurchaseHistory` in `Info.plist`, or refunded packs vanish from history instead. |
 | **StoreKit Testing is not the App Store.** | The test host runs the real StoreKit client against a `.storekit` configuration, including a promotional offer purchase. | Verify in the sandbox before release; eligibility and renewal timing differ. |
 | **Platform scope.** | iOS 15+. macOS is a test host only; Linux builds the engine and fakes only. | Do not ship the package on macOS. |
 
 ## Known defects and limitations
 
-As of 2026-11-14 there is no known correctness defect in a shipping code path. The open items:
+The 2026-11-17 review (`Reviews/2026-11-17-skeptical-review.md`) confirmed 25 findings; every one was fixed, with a
+regression test, in the cycle recorded in `Reviews/2026-11-19-fix-plan.md`. What is open or accepted:
 
+- **Multi-device overspend** (accepted). Each device spends against the balance it last pulled; offline, or between
+  pulls, the devices of one account can spend the same tokens. The merge keeps every debit, the balance goes
+  negative and token gates stay closed until it is repaid. Show `available`, not `balance`.
+- **Expiry is judged by the device clock** (accepted). StoreKit's transactions are the only source of entitlements,
+  but a forward clock shows a subscriber as free and a backward clock keeps a lapsed cached subscription until the
+  launch resolution.
+- **The audit chain is evidence, not proof.** Unkeyed and anchored on the device, it detects corruption and partial
+  edits, not a rewrite by whoever controls the container. Forward records to a server when evidence must hold against
+  the user.
+- **The outbox of a device with no iCloud account grows on disk.** `ledger.log` stays bounded (the covered events
+  wait in `outbox.log`, which no launch decodes), but nothing acknowledges them until the user signs in.
+- **The signer has no volume bound of its own.** The optional `RATE_LIMITER` binding and a WAF rule are the bounds;
+  throttled requests still count toward a Workers Free quota.
+- **Volume Purchase installs are not grandfathered.** The VPP receipts examined so far carry no original version or
+  purchase date and fail closed; `AppTransaction` reportedly does not serve them either.
+- **The receipt path needs a device identifier.** A receipt is admitted only for the device it was issued to
+  (`identifierForVendor`); where there is none (macOS, iOS before first unlock) it answers nothing and the cached
+  snapshot stands, so the receipt path never grandfathers a Mac.
 - **Win-back offers** are modelled in the storefront for display, but no `purchase` call redeems one: the iOS 18
   purchase option is not passed yet.
 - **The 25 ms draw bound** is measured on macOS and on the iOS Simulator, not on a device.
@@ -264,8 +287,11 @@ simulated:
   checks a real receipt reads it from a path outside the repository and is skipped without one.
 - `*.p8` is gitignored at the root and in the worker.
 
-The real values exist in two places only: App Store Connect, and the Cloudflare Worker's secrets. CI runs entirely on
-the simulated ones.
+The private key lives in the Worker's secrets and in the `.p8` downloaded once from App Store Connect; keep that file
+out of the repository, or delete it after `wrangler secret put`. The key id and issuer id are not secret: every signature
+carries them, the worker returns the key id and serves it at `/v1/keys`. They stay out of this repository because they
+identify the publisher. The real receipt for the production-receipt lane stays outside the repository. CI runs entirely
+on the simulated values, and its `forbidden-constructs` job fails on any tracked `.p8` or PEM key material.
 
 ## More
 

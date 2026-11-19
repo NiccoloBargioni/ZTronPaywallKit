@@ -16,6 +16,16 @@ export interface Env {
   APPLE_BUNDLE_IDS?: string;
   /** Optional JSON `{"<productId>": ["<offerId>", ...]}`: only these offers get signed. Unset signs any offer of an allowed app. */
   ALLOWED_OFFERS?: string;
+  /**
+   * Optional: a Rate Limiting binding (`ratelimits` in wrangler.jsonc). When bound, the sign route checks it per
+   * client IP before reading the body and answers 429 `rate_limited` when the limit is hit. Unbound, there is no limit.
+   */
+  RATE_LIMITER?: RateLimiter;
+}
+
+/** The shape of Cloudflare's Rate Limiting binding that the worker uses. */
+export interface RateLimiter {
+  limit(options: { key: string }): Promise<{ success: boolean }>;
 }
 
 /** A JWK with the key id, as a JWKS lists it. */
@@ -44,14 +54,14 @@ function required(env: Env, name: keyof Env): string {
 }
 
 export function parseBundleIds(text: string): ReadonlySet<string> {
-  const ids = text
-    .split(",")
-    .map((id) => id.trim())
-    .filter((id) => id.length > 0);
+  // Messages name the entry's position (1-based, counted in the comma-separated text), never the value: a secret
+  // pasted into the wrong variable must not end up in the logs.
+  const entries = text.split(",").map((id) => id.trim());
+  const ids = entries.filter((id) => id.length > 0);
   if (ids.length === 0) throw new ConfigError("APPLE_BUNDLE_IDS names no bundle id");
-  for (const id of ids) {
-    if (!BUNDLE_ID.test(id)) throw new ConfigError(`APPLE_BUNDLE_IDS: malformed bundle id ${JSON.stringify(id)}`);
-  }
+  entries.forEach((id, index) => {
+    if (id.length > 0 && !BUNDLE_ID.test(id)) throw new ConfigError(`APPLE_BUNDLE_IDS: malformed bundle id (entry ${index + 1})`);
+  });
   return new Set(ids);
 }
 
@@ -68,9 +78,10 @@ export function parseAllowedOffers(text: string | undefined): ReadonlyMap<string
   }
   const map = new Map<string, ReadonlySet<string>>();
   for (const [productId, offers] of Object.entries(parsed as Record<string, unknown>)) {
-    if (!PRODUCT_ID.test(productId)) throw new ConfigError(`ALLOWED_OFFERS: malformed product id ${JSON.stringify(productId)}`);
+    // No value in the message (see parseBundleIds); no position either, since Object.entries reorders integer-like keys.
+    if (!PRODUCT_ID.test(productId)) throw new ConfigError("ALLOWED_OFFERS: malformed product id");
     if (!Array.isArray(offers) || offers.length === 0 || !offers.every((offer) => typeof offer === "string" && OFFER_ID.test(offer))) {
-      throw new ConfigError(`ALLOWED_OFFERS: ${productId} must list offer ids`);
+      throw new ConfigError("ALLOWED_OFFERS: a product must list offer ids");
     }
     map.set(productId, new Set(offers as string[]));
   }

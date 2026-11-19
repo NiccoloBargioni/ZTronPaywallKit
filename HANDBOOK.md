@@ -198,7 +198,7 @@ tokens once the first pull answers. A device with no iCloud account is told so b
 (`CloudDatabaseError.noAccount`) and grants on its own, as if it had none; signed in later, it uploads that grant
 like any event, and should the account already hold another build's grant from another device, the ids collide and
 each device keeps the one it wrote. A reinstall whose Keychain snapshot stands in for history is not a new account
-either. Without any carrier the package has no memory of the account beyond StoreKit, so a delete-and-reinstall
+either, at that launch or at any later one: the snapshot stands until the carrier delivers the account's history. Without any carrier the package has no memory of the account beyond StoreKit, so a delete-and-reinstall
 grants again, as any local trial would.
 
 ## Gating
@@ -225,8 +225,14 @@ withPaywall(.tokens(2), id: "export") { exportPDF() }
 ```
 
 Each `.tokens(n)` draw grants a lease of `tolerance` seconds (300 by default) on that gate id. Re-opening
-the same gate inside the lease costs nothing. A `.deductNow` view that drew stays `.drawn` for as long as it is
-on screen; its own lease is what keeps it open on later evaluations, and nothing logs a second open for it.
+the same gate inside the lease costs nothing. A gated view pins the lease it holds: once it drew (`.deductNow`),
+once something inside committed its reservation, or once it found a live lease on appear. While the view is on
+screen the pinned lease ignores the clock: commits through `\.paywallGate` and any `withPaywall` with that id, at
+any `n`, open `.leased` without drawing, and `tolerance` starts counting when the view leaves (or when its decision
+closes). So a view gate costs `n` per visit; per-use pricing inside a view needs a plain `withPaywall` with an id of
+its own, which is still free within `tolerance`. A `.deductNow` view that drew stays `.drawn` for as long as it is
+on screen, and nothing logs a second open for it. `.tokens(0)` and negative costs are caller errors: nothing rejects
+them up front; at run time they fail closed like `.paid`, and a debug build logs a warning.
 
 The denied view receives the same `PaywallFailure` value the engine published, so `failure.claim()` from inside
 it stops the global sheet, and `PaywallFailureKey` carries one value per closed spell rather than one per render.
@@ -300,7 +306,10 @@ the layer goes, through the hosting controller's presence signal, without relyin
 by every resolution in `Transaction.all`, which lists finished consumables only when the app's `Info.plist` sets
 `SKIncludeConsumableInAppPurchaseHistory` (set it; the test host does). Prices and offers come with the storefront
 (see Catalog and storefront); offline, `products()` returns the last storefront marked not purchasable. The package
-never calls `AppStore.sync()` or refreshes the receipt on its own; only `restorePurchases()` does.
+never calls `AppStore.sync()` or refreshes the receipt on its own; only `restorePurchases()` does. A pack whose
+credit the journal could not write (a full disk) is not finished: the purchase reports `.pending`, the credit is
+retried at every later resolution in the session, and StoreKit redelivers the unfinished transaction at the next
+launch; the deterministic `credit:<id>` keeps the retry idempotent, so nothing is ever credited twice.
 
 The outcome chains like a gate's. A store error is thrown by `purchase` itself, so the `try` stays and no handler
 runs. A purchase does not re-run the `withPaywall` call it was bought for: open view gates re-evaluate on their own,
@@ -309,12 +318,20 @@ a call site runs the action again.
 ```swift
 try await Paywall.shared.purchase(product, source: failure.source)
     .onPurchaseCompleted { transactionID in dismiss() }   // ledger and entitlement already updated
-    .onPurchasePending { dismiss() }                      // Ask to Buy: the transaction arrives on `Transaction.updates`
+    .onPurchasePending { dismiss() }                      // Ask to Buy, or a credit the journal could not write yet
     .onPurchaseCancelled { }
 ```
 
 `StoreKit2Client` is `@concurrent`: StoreKit's work and the receipt parse run off the caller's actor, so the
-main actor's only disk I/O stays the draw path. `Subscription.willAutoRenew` is `true` from a transaction
+main actor's only disk I/O stays the draw path. `AppTransaction.shared` is the app transaction on iOS 16 and later;
+the receipt stands in only when it throws (offline with nothing cached), never when it answers unverified, so a
+planted receipt cannot override StoreKit's answer. `appTransactionID` is read on every iOS 16 system (the accessor
+is back-deployed), and the `""` it reads below iOS 18.4 when the payload has none is treated as no id. A lapsed
+subscription StoreKit still lists costs one more App Store read, for the end of its billing grace period
+(`RenewalInfo.gracePeriodExpirationDate`): the subscription stays `.inGracePeriod`, with `gracePeriodEndsAt`, until
+then; offline that read fails and the lapsed row resolves free, as before grace was modelled. `Subscription.isTrial`
+means the introductory offer in free-trial mode: a paid introductory period (pay as you go, pay up front) is a
+paying period, and a free promotional or offer-code period is not the introductory trial. `Subscription.willAutoRenew` is `true` from a transaction
 (StoreKit does not put the renewal preference on it); the account screen reads the renewal state through
 `subscriptionPhase()`.
 
@@ -391,14 +408,25 @@ revocation like a refund.
   rotates the signing certificate and a 2015 receipt stays valid after its certificate expired;
 - the signer carries Apple's receipt-signing marker extension `1.2.840.113635.100.6.11.1`, so a certificate
   Apple issued for anything else cannot sign one;
-- field 2 names this app's bundle id.
+- field 2 names this app's bundle id;
+- field 5 is the device hash of Apple's validation guide: SHA-1 of the device's `identifierForVendor` bytes, the
+  opaque value (field 4) and the bundle id as the receipt encodes it (field 2). It binds the receipt to the device
+  that bought it, so a stranger's genuine paid-era receipt planted in the container grandfathers nothing. Without
+  an identifier (macOS, iOS before first unlock) the receipt answers nothing and the cached snapshot stands.
 
-Not checked: the device GUID hash (field 5), which binds a receipt to one device. It needs
-`identifierForVendor` and only matters against a user copying their own receipt between their own devices.
+The receipt type (field 0) maps exactly: `Production` and `ProductionVPP` are the App Store, `ProductionSandbox`,
+`ProductionVPPSandbox` and `Sandbox` the sandbox, anything else (`Xcode`, `ProductionStub`, an unknown type, none)
+is `.xcode`, which the default policy refuses. No prefix match, so `ProductionStub` never reads as production. An
+empty original version (field 19) is missing, in the parser and in the rule; the Volume Purchase expiration (field
+21) is read and a receipt past it is refused. The VPP receipts examined so far carry neither field 19 nor 18, so
+VPP installs fail closed before the type is read. The DER reader holds slices of the input, never copies, and
+refuses a nest deeper than 64 levels, so a crafted container costs its own size and no more before verification
+refuses it.
 
 The Mac App Store receipts installed on the machine running the tests are verified as a bonus: purchase
-receipts (`Production`) verify and parse; Apple's `ProductionStub` receipts for its bundled apps carry no
-original version and fail closed, as they should.
+receipts (`Production`) verify, parse and carry the device binding; Apple's `ProductionStub` receipts for its
+bundled apps carry no original version and fail closed, as they should. A Mac receipt is bound to the Mac's GUID,
+not an `identifierForVendor`, so the device check cannot pass there and the receipt path never grandfathers a Mac.
 
 ## Crash safety
 
@@ -448,10 +476,16 @@ What a long-lived install must not pay for its history, and what the package for
   earlier process wrote is covered: a debit drawn before `start()` got there stays in the log for the next launch's
   repair, and nothing is written after `shutdown()`. The rewrite goes to a side file that is synced and renamed over
   the log, as compaction always did; an interrupted one leaves the old log intact and the side file is deleted at the
-  next open. What survives the rewrite: the checkpoint; the outbox, the events the carrier has not acknowledged, kept
-  behind the checkpoint that already counts them (replays to the ledger, dropped by the next compaction once
-  acknowledged); and every event appended since. Without a carrier nothing will ever acknowledge the outbox, so none
-  is kept, and a carrier configured by a later build receives the events written since the last checkpoint only. The
+  next open. What survives the rewrite: the checkpoint; the carrier's cursor (`.cursor`, the position of the last merged
+  batch) and the adopted Keychain baseline while it stands (`.baseline`), both kept in place; and every event
+  appended since. The events a checkpoint counts that the carrier has not acknowledged move to `outbox.log`, a
+  second framed file beside the log that no open decodes: `pendingUpload` reads it only when a push runs, an
+  acknowledgement prunes it, and a head drop of `ledger.log` deletes it (those events are then counted by the
+  Keychain baseline, not pushed on top of it). A log in the earlier shape, with the covered outbox behind the
+  checkpoint, moves it out at the first `start()`. A device without an iCloud account checkpoints like any other;
+  its outbox grows on disk, not in the log, until the user signs in, and the carrier reports the account on every
+  pull so the engine pushes the moment it is back. Without a carrier nothing will ever acknowledge the outbox, so
+  none is kept, and a carrier configured by a later build receives the events written since the last checkpoint only. The
   marker compaction at open stays: `ledger.log` is rewritten when it holds more `.uploaded` markers than the
   threshold, and with a checkpoint in front the acknowledged events it counts go too. A corrupt checkpoint, or one
   from a newer build's format, drops the log like any undecodable first frame; the Keychain snapshot and the carrier
@@ -462,22 +496,39 @@ What a long-lived install must not pay for its history, and what the package for
   Dropping a file writes `audit.anchor`, the hash of the last record dropped: `verifyAuditChain` checks the retained
   chain from there, and the export carries the anchor. The launch repair (`auditRepaired`) only considers debits
   newer than the oldest retained record; older ones have simply been rotated out. A refunded debit counts as known
-  to the audit. The chain's last hash is read from the tail of the newest file, not by decoding every file.
+  to the audit. The chain's last hash is read from the tail of the newest file, not by decoding every file, and the
+  repair looks up only its candidates (the debits newer than the retained start that the trail does not know),
+  newest file first, decoding only the lines that name a debit and stopping once every candidate is found; a launch
+  with nothing to check decodes no record at all.
 
 ## Reinstall and the Keychain snapshot
 
-After a reinstall the Keychain snapshot stands in for the history this install has not seen. Once the carrier
-has answered with events for the account, the snapshot steps aside: if its last event is among them the ledger
-is complete; if not, that event was never uploaded and died with the old install, and keeping the snapshot on
-top of the remote history would count every uploaded credit twice. A carrier that answers with nothing (iCloud
-off, empty container) leaves the snapshot standing.
+After a reinstall the Keychain snapshot stands in for the history this install has not seen. It is adopted at
+`start()`, written to the journal as a `.baseline` record and kept there, launch after launch, until the carrier
+settles it: with fresh events for the baseline's account (events new to the ledger, never this install's own
+pushes coming back as echoes), or with the baseline's own last event. Then the snapshot steps aside: if its last
+event is among them the ledger is complete; if not, that event was never uploaded and died with the old install,
+and keeping the snapshot on top of the remote history would count every uploaded credit twice. A carrier that
+answers with nothing (iCloud off, an empty container) leaves the snapshot standing, and so does one that cannot
+answer at all. While a baseline stands the Keychain item keeps its provenance: the balance is the baseline plus
+what this install wrote since, and the last event is the baseline's, so a second reinstall adopts the same
+history. A `{0, nil}` item is no history, and a fresh install is still welcomed.
 
-The snapshot is adopted at `start()` only when the ledger holds no events for its account: a reinstall, or a
-new device. A ledger with history never gets a snapshot added on top, because it cannot tell which part of that
-history the snapshot already counts. The item is `synchronizable`, so another device's snapshot can arrive
-through iCloud Keychain before that device's debits were pulled; adopted over the local history, it would count
-every local credit twice (a 10-pack read as 19 at an offline relaunch). This device's own snapshot written ahead
-of a journal that lost its tail would do the same. Neither is adopted.
+The snapshot is adopted only when the ledger holds no events for its account: a reinstall, or a new device. A
+ledger with history never gets a snapshot added on top, because it cannot tell which part of that history the
+snapshot already counts. The item is this device's (`synchronizable: false` by default): another device's balance
+reaches this one through the carrier, with the history behind it, not through iCloud Keychain ahead of it, where
+adopted over the local history it would count every local credit twice (a 10-pack read as 19 at an offline
+relaunch). An item an earlier build wrote as synchronizable is still read when no local one exists. This device's
+own snapshot written ahead of a journal that lost its tail is not adopted either.
+
+The carrier's position is the engine's. `LedgerSync.pull(since:)` fetches from the cursor stored in `ledger.log`
+with the batch it covers, in the same write, so nothing is committed before it is durable; `nil` from the carrier
+means it did not look (its pull interval), which settles nothing. A pull whose merge fails (a full disk) leaves the
+cursor where it was and asks the carrier to pull again; a pull that resolves after `shutdown()` commits nothing.
+After a dropped log (a corrupt first frame, a checkpoint from a newer build) the surviving cursor is older than
+every surviving event, so the next pull refetches what was lost from the account, and the device id is rotated so
+that events written meanwhile cannot fork the old stream.
 
 ## Simulator (debug builds)
 
@@ -507,8 +558,12 @@ file, `Tests/PaywallKitTests/Fixtures/Paywall.storekit`, is the one the simulato
 `the_storekit_configuration_matches_the_test_catalog` keeps it in step with the test catalog. The host app runs
 the same check against its own file.
 
-`Scripts/check-release-symbols.sh` builds release and fails if a shipping module contains simulator, preset,
-launch-argument, fake, override or simulation-hook symbols, or if `PaywallSimulator` is not empty.
+`Scripts/check-release-symbols.sh` builds release and checks every module the platform builds, failing by name on
+one it cannot list: a shipping module (`PaywallCore`, `PaywallKit`, `PaywallCloudSync`) may define no symbol whose
+raw or demangled name mentions the simulator, the presets, the launch arguments, the fakes or the grandfather
+override, and the two debug-only modules (`PaywallSimulator`, `PaywallTesting`) may define no Swift symbol at all.
+`--self-test` runs the classifiers over fixture listings, and CI runs it before the real check. A stripped `.ipa`
+keeps few symbols, so a host app's archive check is its own.
 
 ## Development
 
@@ -606,10 +661,10 @@ variable, switched off, for running the suite from Xcode. The run is the TestHos
 xcrun xccov view --report --json /tmp/live.xcresult > /tmp/live-xccov.json && Scripts/coverage-gate.sh --baseline coverage-baseline.json --xccov /tmp/package-xccov.json --xccov /tmp/live-xccov.json
 ```
 
-With it PaywallCloudSync measures 99.08% of lines: the live lane's `CloudKitDatabase.swift` includes the error paths
+With it PaywallCloudSync measured 99.08% of lines (2026-11-13): the live lane's `CloudKitDatabase.swift` includes the error paths
 (deleted zone, expired token) because the suite provokes them against the server, so only the one-line fold of a
 whole-call zone error is left to the fake. Do not write that run back with `--write-baseline`: `coverage-baseline.json`
-ratchets what CI measures, the package lane and the unsigned host lane, where PaywallCloudSync is at 97.24%.
+ratchets what CI measures, the package lane and the unsigned host lane, where PaywallCloudSync is at 97.49%.
 
 The test host (`TestHost/`) is the smallest iOS app that can host `SKTestSession` and a UIKit modal
 presentation: StoreKit refuses purchases, `AppTransaction` and simulated external purchases in a process without
@@ -627,7 +682,13 @@ two `Paywall.shared`s is how a claim gets lost. It needs iOS 17 for the StoreKit
 - 100% line and region coverage on the crash-critical files: `Journal`, `LedgerEvent`, `Ledger`,
   `LeaseTable`, `ReservationTable`, `GateEngine+Draw` and `CreditReconciler`.
 
-With `--baseline`, neither number may drop for any target. `llvm-cov` counts lines per function, closures
+With `--baseline`, neither number may drop for any target. Without `--targets` the expected set is the union of
+the targets measured and the baseline's, so a target that vanished from a run fails as missing instead of
+disappearing; a `--baseline` that does not exist is an error unless it is the file being written; a target with no
+region data reads `n/a` and fails against a baseline that has a number for it; `--write-baseline` merges this run's
+targets into the file, ratchets against it too, and writes only when the gate passes; `--retire <target>` drops a
+renamed or deleted target from the union and the file. `Scripts/coverage-gate-selftest.sh` checks all of this over
+stubbed toolchain commands, in CI's `forbidden-constructs` job. `llvm-cov` counts lines per function, closures
 included, so a never-run closure or `??` fallback on an executed line costs a line: the four CloudKit forwarders
 and the two container initialisers in `PaywallCloudSync` are written as single statements for that reason, and
 only the live CloudKit lane executes them (CloudKit traps outside an entitled host).
@@ -637,8 +698,11 @@ only the live CloudKit lane executes them (CloudKit traps outside an entitled ho
 `Scripts/make-receipt-fixtures.sh` regenerates `Tests/PaywallKitTests/Fixtures`: a throwaway root → intermediate
 → leaf chain shaped like Apple's (the leaf carries the receipt-signing marker) and receipts signed in every
 layout the verifier accepts or refuses: SHA-256 without attributes (Apple's), SHA-1, signed attributes, an
-expired signer with and without a creation date, a leaf without the marker, another app's bundle id. Keys are
-discarded; only the root certificate and the receipts are kept. The verifier is pointed at that root in tests
+expired signer with and without a creation date, a leaf without the marker, another app's bundle id. Every receipt
+carries the device binding of Apple's guide (fields 4 and 5) for a fixed fixture identifier, the one the tests pass
+as the device; `receipt-other-device.der` is bound to another identifier and `receipt-no-device-hash.der` carries no
+binding, so the refusals are exercised against genuine signatures. Keys are discarded; only the root certificate and
+the receipts are kept. The verifier is pointed at that root in tests
 and at the Apple Root CA in production.
 
 A real **production receipt** of your app runs through the same checks, and then the grandfathering rule, when
@@ -650,6 +714,12 @@ changed payload byte is refused. A receipt names its app, so none is committed a
 ```bash
 PAYWALL_PRODUCTION_RECEIPT=/path/to/receipt swift test --filter ProductionReceiptTests
 ```
+
+Two more variables extend the lane. `PAYWALL_PRODUCTION_DEVICE_ID`, the install's `identifierForVendor`, proves the
+device binding positively (the receipt is admitted for that identifier and for no other); without it the lane proves
+only the refusal of a random identifier. `PAYWALL_PRODUCTION_APP_TRANSACTION`, a file holding the same install's
+`AppTransaction` JWS (`VerificationResult.jwsRepresentation`, captured with the support export of step 3 below),
+runs the account-key parity check between Apple's two sources for one install, which no fixture can stand in for.
 
 Such a receipt can only come from an App Store install of the paid app. The ways to get one, in order of
 usefulness:

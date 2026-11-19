@@ -13,8 +13,9 @@ import Security
 /// 3. The signer certificate carries Apple's receipt-signing marker extension, so a certificate Apple issued for
 ///    anything else (a developer's own code-signing identity also chains to the Apple Root CA) cannot sign one.
 ///
-/// Fails closed on any parse error, unknown algorithm, missing certificate or trust failure. No network: the
-/// evaluation never fetches a CRL or OCSP response.
+/// The container is parsed first (the parser is bounded in depth and copies nothing), then the signature is checked
+/// over the parsed payload. Fails closed on any parse error, unknown algorithm, missing certificate or trust failure.
+/// No network: the evaluation never fetches a CRL or OCSP response.
 public struct AppleReceiptVerifier: ReceiptVerifier {
     /// Apple Inc. Root Certificate, SHA-256 b0b1730ecbc7ff4505142c49f1295e6eda6bcaed7e2c68c5be91b5a11001f024, as the
     /// system trust store ships it and as https://www.apple.com/certificateauthority/ publishes it.
@@ -93,7 +94,8 @@ public struct AppleReceiptVerifier: ReceiptVerifier {
         guard let expected = messageDigest?.child(1)?.child(0)?.octetBytes, let actual = digest(payload, signer.digestAlgorithm),
             expected == actual
         else { return nil }
-        var set = attributes.raw
+        // A copy: the node's bytes are a slice of the receipt, which stays as read.
+        var set = Array(attributes.raw)
         set[0] = 0x31
         return Data(set)
     }

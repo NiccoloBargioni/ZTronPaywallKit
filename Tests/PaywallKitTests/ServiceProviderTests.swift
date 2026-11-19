@@ -1,10 +1,10 @@
 import Combine
 import Foundation
-import PaywallCore
 import PaywallTesting
 import SwiftUI
 import Testing
 
+@testable import PaywallCore
 @testable import PaywallKit
 
 #if canImport(AppKit)
@@ -19,6 +19,7 @@ import Testing
 @MainActor
 private func fakeBacked(store: FakeStore = FakeStore(products: products), welcomeTokens: Int = 0) -> Paywall.Configuration {
     var configuration = Paywall.Configuration(catalog: catalog)
+    configuration.fileKeyStore = InMemoryFileKeyStore()
     configuration.store = store
     configuration.clock = FakeClock()
     configuration.storageDirectory = makeTemporaryPaywallDirectory()
@@ -27,6 +28,58 @@ private func fakeBacked(store: FakeStore = FakeStore(products: products), welcom
     configuration.welcomeTokens = welcomeTokens
     return configuration
 }
+
+/// A `FakeStore` whose next purchase waits until released: a payment sheet still up while the facade reconfigures.
+private actor HoldingStore: StoreClient {
+    let inner: FakeStore
+    private var holdsLeft = 0
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private(set) var heldPurchases = 0
+
+    init(_ inner: FakeStore) { self.inner = inner }
+
+    func holdNextPurchase() { holdsLeft += 1 }
+
+    func release() {
+        let waiting = waiters
+        waiters = []
+        for waiter in waiting { waiter.resume() }
+    }
+
+    func currentEntitlements() async throws -> [StoreTransaction] { try await inner.currentEntitlements() }
+    func allTransactions() async throws -> [StoreTransaction] { try await inner.allTransactions() }
+    func appTransaction() async throws -> AppTransactionSnapshot? { try await inner.appTransaction() }
+    func updates() async -> AsyncStream<StoreTransaction> { await inner.updates() }
+    func purchaseIntents() async -> AsyncStream<String> { await inner.purchaseIntents() }
+    func products(for ids: Set<String>) async throws -> [PaywallProduct] { try await inner.products(for: ids) }
+
+    func purchase(productID: String, offer: SignedPromotionalOffer?) async throws -> StorePurchaseResult {
+        if holdsLeft > 0 {
+            holdsLeft -= 1
+            heldPurchases += 1
+            await withCheckedContinuation { waiters.append($0) }
+        }
+        return try await inner.purchase(productID: productID, offer: offer)
+    }
+
+    func sync() async throws { try await inner.sync() }
+    func finish(transactionID: UInt64) async { await inner.finish(transactionID: transactionID) }
+    func subscriptionPhase(groupID: String) async throws -> SubscriptionPhase? { try await inner.subscriptionPhase(groupID: groupID) }
+    func renewalGraceEnd(groupID: String) async throws -> Date? { try await inner.renewalGraceEnd(groupID: groupID) }
+    func isEligibleForIntroOffer(groupID: String) async -> Bool { await inner.isEligibleForIntroOffer(groupID: groupID) }
+    func storefrontCountryCode() async -> String? { await inner.storefrontCountryCode() }
+}
+
+@MainActor
+private func waitFor(_ condition: () async -> Bool) async -> Bool {
+    for _ in 0..<400 {
+        if await condition() { return true }
+        try? await Task.sleep(nanoseconds: 2_000_000)
+    }
+    return await condition()
+}
+
+private let mapGate = PaywallSource(id: "map", fileID: "f", function: "g", line: 1)
 
 /// Puts `view` on screen in a real window (AppKit or UIKit).
 @MainActor
@@ -221,6 +274,155 @@ struct ServiceProviderTests {
         #expect(provider.useProduction() === provider)
         #expect(provider.isFake)
         #expect(paywall.engine === engine, "nothing to return to: the facade is not configured again")
+    }
+
+    // MARK: A8: views on screen follow the provider's switches
+
+    @Test func a_denied_paid_view_opens_when_the_provider_switches_to_a_paying_fake() async throws {
+        let paywall = Paywall()
+        let provider = PaywallServiceProvider(.production(fakeBacked()), paywall: paywall)
+        await paywall.waitUntilStarted()
+        let holder = UUID()
+        var changes: [GateSessionState] = []
+        let denied = paywall.openSession(holder: holder, level: .paid, policy: .reserve, source: mapGate, scope: nil) { changes.append($0) }
+        #expect(denied.failure?.reason == .requiresPaid)
+        let lifetime = StoreTransaction.lifetime(id: 9, productID: "pro.lifetime", purchased: Date())
+        provider.use(.fake(fakeBacked(store: FakeStore(entitlements: [lifetime], products: products))))
+        await paywall.waitUntilStarted()
+        #expect(changes.last?.decision == .open(.paying), "\(changes)")
+        #expect(paywall.engine?.sessionState(holder)?.isOpen == true)
+        paywall.closeSession(holder: holder)
+    }
+
+    @Test func a_denied_paid_view_opens_after_useProduction_and_a_purchase() async throws {
+        let paywall = Paywall()
+        let production = fakeBacked()
+        let provider = PaywallServiceProvider(.production(production), paywall: paywall)
+        await paywall.waitUntilStarted()
+        _ = provider.useFake(fakeBacked())
+        await paywall.waitUntilStarted()
+        let holder = UUID()
+        var changes: [GateSessionState] = []
+        _ = paywall.openSession(holder: holder, level: .paid, policy: .reserve, source: mapGate, scope: nil) { changes.append($0) }
+        _ = provider.useProduction()
+        await paywall.waitUntilStarted()
+        #expect(changes.last?.isOpen == false, "reopened on the production engine: still free")
+        _ = try await paywall.purchase(products[3])
+        #expect(changes.last?.decision == .open(.paying), "the production engine knows the view and flips it: \(changes)")
+        paywall.closeSession(holder: holder)
+    }
+
+    /// A8: a view that drew its token on appear survives a same-journal `useProduction`: it is pinned first, so the
+    /// successor draws nothing, and it stays open past the tolerance.
+    @Test func a_drawn_view_survives_a_same_journal_switch_without_a_second_debit() async throws {
+        let paywall = Paywall()
+        let clock = FakeClock()
+        var production = fakeBacked(welcomeTokens: 5)
+        production.clock = clock
+        let provider = PaywallServiceProvider(.production(production), paywall: paywall)
+        await paywall.waitUntilStarted()
+        #expect(paywall.wallet.balance == 5)
+        let holder = UUID()
+        var changes: [GateSessionState] = []
+        let drawn = paywall.openSession(holder: holder, level: .tokens(1), policy: .deductNow, source: mapGate, scope: nil) { changes.append($0) }
+        #expect(drawn.decision == .open(.drawn(1)) && paywall.wallet.balance == 4)
+        _ = provider.useProduction(production)  // the same directory, store and clock: a successor on the same journal
+        await paywall.waitUntilStarted()
+        #expect(paywall.wallet.balance == 4, "no second debit")
+        #expect(changes.last?.isOpen == true, "\(changes)")
+        clock.advance(by: 301)  // past the tolerance: the pin keeps it
+        await settle()
+        #expect(paywall.engine?.sessionState(holder)?.isOpen == true)
+        #expect(paywall.wallet.balance == 4)
+        paywall.closeSession(holder: holder)
+    }
+
+    // MARK: A5: a payment sheet up across a reconfigure
+
+    /// A5: the purchase completes on an engine the facade has replaced. The credit goes to the engine current when it
+    /// lands, once, finished once, and both chains verify, with a successor that compacted at start (seeds past the
+    /// compaction threshold) and one that did not.
+    @Test(arguments: [4_100, 5])
+    func a_purchase_that_completes_after_a_reconfigure_is_credited_by_the_successor(seeds: Int) async throws {
+        let paywall = Paywall()
+        let fake = FakeStore(products: products)
+        let store = HoldingStore(fake)
+        var configuration = fakeBacked()
+        configuration.store = store
+        configuration.fullSync = false
+        configuration.audit = [JournalSink(directory: try #require(configuration.storageDirectory))]
+        let provider = PaywallServiceProvider(.production(configuration), paywall: paywall)
+        await paywall.waitUntilStarted()
+        for i in 0..<seeds { paywall.grant(tokens: 1, reason: "seed", id: "grant:seed:\(i)") }
+        #expect(paywall.wallet.balance == seeds)
+        await store.holdNextPurchase()
+        let purchase = Task { try await paywall.purchase(products[4]) }  // tokens.10: the sheet is up
+        #expect(await waitFor { await store.heldPurchases == 1 })
+        _ = provider.useProduction(configuration)  // the same directory: a successor engine, the predecessor shut down
+        await paywall.waitUntilStarted()
+        #expect((paywall.engine?.journal.checkpoint != nil) == (seeds > 4_096), "the successor compacts at start past the threshold")
+        await store.release()
+        let outcome = try await purchase.value
+        guard case .purchased(let id) = outcome else {
+            Issue.record("expected a purchase, got \(outcome)")
+            return
+        }
+        #expect(paywall.wallet.balance == seeds + 10)
+        #expect(await fake.finished == [id])
+        #expect(paywall.engine?.ledger.events.filter { $0.id == "credit:\(id)" }.count == 1)
+        let chains = await paywall.verifyAuditChain()
+        #expect(chains.audit == nil && chains.ledger == nil)
+        // The next launch sees the same.
+        _ = provider.useProduction(configuration)
+        await paywall.waitUntilStarted()
+        #expect(paywall.wallet.balance == seeds + 10)
+        #expect(paywall.engine?.ledger.events.filter { $0.id == "credit:\(id)" }.count == 1)
+        let again = await paywall.verifyAuditChain()
+        #expect(again.audit == nil && again.ledger == nil)
+    }
+
+    /// A5: the sheet completes after the facade went passthrough: no engine can take the transaction, so it stays
+    /// unfinished for the next launch's `Transaction.updates`, and the purchase reports `.pending`.
+    @Test func a_purchase_that_completes_after_a_switch_to_passthrough_stays_pending() async throws {
+        let paywall = Paywall()
+        let fake = FakeStore(products: products)
+        let store = HoldingStore(fake)
+        var configuration = fakeBacked()
+        configuration.store = store
+        paywall.configure(configuration)
+        await paywall.waitUntilStarted()
+        await store.holdNextPurchase()
+        let purchase = Task { try await paywall.purchase(products[4]) }
+        #expect(await waitFor { await store.heldPurchases == 1 })
+        var off = configuration
+        off.passthrough = true
+        paywall.configure(off)
+        await store.release()
+        #expect(try await purchase.value == .pending)
+        #expect(await fake.finished.isEmpty)
+        #expect(paywall.engine == nil && paywall.isPassthrough)
+    }
+
+    /// A5: the sheet is cancelled after the reconfigure: nothing is credited or finished anywhere.
+    @Test func a_purchase_cancelled_after_a_reconfigure_changes_nothing() async throws {
+        let paywall = Paywall()
+        let fake = FakeStore(products: products)
+        let store = HoldingStore(fake)
+        var configuration = fakeBacked(welcomeTokens: 3)
+        configuration.store = store
+        let provider = PaywallServiceProvider(.production(configuration), paywall: paywall)
+        await paywall.waitUntilStarted()
+        await store.holdNextPurchase()
+        let purchase = Task { try await paywall.purchase(products[4]) }
+        #expect(await waitFor { await store.heldPurchases == 1 })
+        _ = provider.useProduction(configuration)
+        await paywall.waitUntilStarted()
+        await fake.setNextPurchase(.cancel)
+        await store.release()
+        #expect(try await purchase.value == .cancelled)
+        #expect(paywall.wallet.balance == 3)
+        #expect(await fake.finished.isEmpty)
+        #expect(paywall.engine?.ledger.events.contains { $0.id.hasPrefix("credit:") } == false)
     }
 
     // MARK: Environment

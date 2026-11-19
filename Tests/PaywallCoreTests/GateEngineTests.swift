@@ -29,29 +29,53 @@ struct GateEngineTests {
         #expect(h.engine.run(.paid, source: source("pro")) { 1 }.value == 1)
     }
 
+    /// StoreKit's passive reads never throw; the one failure they can show is never answering. While the launch
+    /// resolution waits, a fresh install has no snapshot, so `.paid` and token gates fail closed and `.free` runs.
     @Test func gates_fail_closed_on_unknown_entitlement() async throws {
         let h = try Harness()
         await h.store.setReachable(false)
-        await h.start()
+        let started = Task { await h.start() }
+        #expect(await eventually { await h.store.pendingReads == 1 })
         #expect(h.engine.entitlement == .unknown)
         #expect(h.engine.run(.paid, source: source("p")) { 1 }.failure?.reason == .entitlementUnavailable)
         #expect(h.engine.run(.tokens(1), source: source("t")) { 1 }.failure?.reason == .entitlementUnavailable)
         #expect(h.engine.run(.free, source: source("f")) { 1 }.value == 1)
-        #expect(h.events.contains { if case .storeUnavailable(_, nil) = $0 { return true } else { return false } })
+        #expect(!h.events.contains { if case .storeUnavailable = $0 { return true } else { return false } })
 
-        // The next successful resolution reopens everything.
+        // The answer lands: the resolution reopens everything.
         await h.store.setReachable(true)
+        await started.value
+        #expect(h.engine.entitlement == .free)
+    }
+
+    /// A host-written store client whose reads throw (StoreKit's never do): the engine publishes `.storeUnavailable`
+    /// and keeps whatever snapshot it has, nothing on a fresh install.
+    @Test func a_throwing_store_client_leaves_the_entitlement_unknown_and_is_reported() async throws {
+        let h = try Harness()
+        await h.store.setPassiveReadFailure(.unreachable)
+        await h.start()
+        #expect(h.engine.entitlement == .unknown)
+        #expect(h.engine.run(.paid, source: source("p")) { 1 }.failure?.reason == .entitlementUnavailable)
+        #expect(h.events.contains { if case .storeUnavailable(_, nil) = $0 { return true } else { return false } })
+        await h.store.setPassiveReadFailure(nil)
         await h.engine.refresh(cause: .foreground)
         #expect(h.engine.entitlement == .free)
     }
 
+    /// A relaunch whose store never answers: the snapshot on disk stands in, and `.paid` passes, until it does.
     @Test func offline_launch_keeps_the_last_snapshot() async throws {
         let h = try Harness()
         await h.store.setEntitlements([.lifetime(id: 7, productID: "pro.lifetime", purchased: h.clock.now)])
         await h.start()
         await h.store.setReachable(false)
-        let engine = try await h.relaunch()
+        let engine = try await h.relaunch(start: false)
         #expect(engine.entitlement == .lifetime(.purchase(transactionID: 7)))
+        let started = Task { await engine.start() }
+        #expect(await eventually { await h.store.pendingReads == 1 })
+        #expect(engine.entitlement == .lifetime(.purchase(transactionID: 7)))
+        #expect(engine.canPass(.paid))
+        await h.store.setReachable(true)
+        await started.value
         #expect(engine.canPass(.paid))
     }
 
@@ -389,6 +413,107 @@ struct GateEngineTests {
         #expect(engine.canPass(.paid) && engine.canPass(.tokens(99)))
     }
 
+    /// B1: the caches next to the journal are authenticated. A planted `app-transaction.json`, plain or enveloped
+    /// with another key's tag, grants nothing offline, as a lifetime or as tokens.
+    @Test func forged_app_transaction_cache_grants_nothing_offline() async throws {
+        let now = FakeClock().now
+        let policy = GrandfatheringPolicy(lastPaidBuild: "116", paidWindow: DateInterval(start: now.addingTimeInterval(-1e7), end: now))
+        let forged = AppTransactionSnapshot(
+            bundleID: "b", originalAppVersion: "90", originalPurchaseDate: now.addingTimeInterval(-1e6), environment: .production,
+            origin: .appTransaction)
+        let payload = try CanonicalJSON.encoder().encode(forged)
+        for grant in [GrandfatheringPolicy.Grant.lifetime, .tokens(20)] {
+            var granting = policy
+            granting.grant = grant
+            // Plain JSON, as an attacker (or an older build) writes it.
+            let plain = try Harness(grandfathering: granting)
+            try payload.write(to: plain.directory.appendingPathComponent("app-transaction.json"))
+            await plain.start()
+            #expect(plain.engine.entitlement == .free && plain.engine.wallet.balance == 0, "\(grant)")
+            #expect(plain.engine.appTransaction == nil && plain.engine.accountKey == unboundAccountKey)
+            #expect(!plain.events.contains { if case .grandfathered = $0 { true } else { false } })
+            // The right shape, tagged with another key.
+            let enveloped = try Harness(grandfathering: granting)
+            let tagged = PaywallFiles.Envelope(mac: PaywallFiles.tag(payload, key: InMemoryFileKeyStore.randomKey()), payload: payload)
+            try CanonicalJSON.encoder().encode(tagged).write(to: enveloped.directory.appendingPathComponent("app-transaction.json"))
+            await enveloped.start()
+            #expect(enveloped.engine.entitlement == .free && enveloped.engine.wallet.balance == 0, "\(grant)")
+            #expect(enveloped.engine.appTransaction == nil)
+        }
+    }
+
+    /// B1: a planted `entitlement.json` is no snapshot: before the store answers the launch fails closed (`.unknown`),
+    /// where a trusted lifetime snapshot would have opened every gate. The engine's own file reads back.
+    @Test func forged_entitlement_snapshot_is_unknown_not_lifetime() async throws {
+        let h = try Harness()
+        let snapshot = PaywallFiles.EntitlementSnapshot(entitlement: .lifetime(.purchase(transactionID: 1)), resolvedAt: h.clock.now)
+        try CanonicalJSON.encoder().encode(snapshot).write(to: h.directory.appendingPathComponent("entitlement.json"))
+        let forged = try await h.relaunch(start: false)
+        #expect(forged.entitlement == .unknown)
+        #expect(!forged.canPass(.paid))
+        await h.store.setEntitlements([.lifetime(id: 1, productID: "pro.lifetime", purchased: h.clock.now)])
+        await forged.start()
+        #expect(forged.entitlement.isPaying)
+        let genuine = try await h.relaunch(start: false)
+        #expect(genuine.entitlement == .lifetime(.purchase(transactionID: 1)))
+    }
+
+    /// B1: a launch with no key at hand (the Keychain before first unlock) writes and trusts nothing, and leaves the
+    /// authenticated cache as it was, so the next launch with the key reads it again.
+    @Test func a_launch_without_the_file_key_keeps_the_cached_grandfather_for_the_next_one() async throws {
+        let now = FakeClock().now
+        let policy = GrandfatheringPolicy(lastPaidBuild: "116", paidWindow: DateInterval(start: now.addingTimeInterval(-1e7), end: now))
+        let h = try Harness(grandfathering: policy)
+        let app = AppTransactionSnapshot(
+            bundleID: "b", originalAppVersion: "90", originalPurchaseDate: now.addingTimeInterval(-1e6), environment: .production,
+            origin: .appTransaction)
+        await h.store.setApp(app)
+        await h.start()
+        #expect(h.engine.entitlement == .lifetime(.grandfathered(originalAppVersion: "90")))
+        let cache = h.directory.appendingPathComponent("app-transaction.json")
+        let written = try Data(contentsOf: cache)
+        // No key, the store still answering: the resolution comes from the store and the file is left alone.
+        let withKey = h.fileKeyStore
+        h.fileKeyStore = InMemoryFileKeyStore(key: nil)
+        let keyless = try await h.relaunch()
+        #expect(keyless.entitlement == .lifetime(.grandfathered(originalAppVersion: "90")), "the store answered")
+        #expect(try Data(contentsOf: cache) == written, "nothing is written without a key")
+        // No key and no store answer: nothing is trusted either.
+        await h.store.setApp(nil)
+        let keylessOffline = try await h.relaunch()
+        #expect(keylessOffline.entitlement == .free)
+        #expect(try Data(contentsOf: cache) == written)
+        // The key is back: the cache written at the first launch still authenticates.
+        h.fileKeyStore = withKey
+        let recovered = try await h.relaunch()
+        #expect(recovered.entitlement == .lifetime(.grandfathered(originalAppVersion: "90")))
+    }
+
+    /// B1: a cache an earlier build wrote in the clear is dropped, not laundered: the engine never wraps it in an
+    /// envelope of its own, and the old `account.key` file goes with it.
+    @Test func a_legacy_plain_cache_is_dropped_and_never_tagged() async throws {
+        let now = FakeClock().now
+        let policy = GrandfatheringPolicy(lastPaidBuild: "116", paidWindow: DateInterval(start: now.addingTimeInterval(-1e7), end: now))
+        let h = try Harness(grandfathering: policy)
+        let legacy = AppTransactionSnapshot(
+            bundleID: "b", originalAppVersion: "90", originalPurchaseDate: now.addingTimeInterval(-1e6), environment: .production,
+            origin: .appTransaction)
+        let cache = h.directory.appendingPathComponent("app-transaction.json")
+        try CanonicalJSON.encoder().encode(legacy).write(to: cache)
+        try Data("k".utf8).write(to: h.directory.appendingPathComponent("account.key"))
+        let launched = try await h.relaunch()  // the store has no app transaction: offline
+        #expect(launched.entitlement == .free)
+        #expect(!FileManager.default.fileExists(atPath: h.directory.appendingPathComponent("account.key").path))
+        let files = PaywallFiles(directory: h.directory, keyStore: h.fileKeyStore)
+        #expect(files.appTransaction() == nil)
+        #expect((try? CanonicalJSON.decoder().decode(PaywallFiles.Envelope.self, from: Data(contentsOf: cache))) == nil, "still the plain file")
+        // Once the store answers, the file is rewritten with a tag of its own and read back.
+        await h.store.setApp(legacy)
+        await launched.refresh(cause: .foreground)
+        #expect(launched.entitlement == .lifetime(.grandfathered(originalAppVersion: "90")))
+        #expect(files.appTransaction() == legacy)
+    }
+
     @Test func grandfather_token_grant_is_once_per_account() async throws {
         let now = FakeClock().now
         let policy = GrandfatheringPolicy(
@@ -409,6 +534,43 @@ struct GateEngineTests {
         #expect(!h.engine.grant(tokens: 5, reason: "welcome", id: "grant:welcome"))
         #expect(!h.engine.grant(tokens: 0, reason: "nothing"))
         #expect(h.engine.wallet.balance == 5)
+    }
+
+    /// A3: a lapsed subscription in its billing grace period keeps the paid gate open until the grace ends, with one
+    /// sleeper for the grace end and no `.free` through the expiry timer before it; at the end it lapses for real.
+    @Test func a_subscription_in_billing_grace_stays_paid_until_the_grace_ends() async throws {
+        let h = try Harness()
+        let now = h.clock.now
+        let graceEnd = now.addingTimeInterval(16 * 86_400)
+        let lapsed = StoreTransaction.subscription(
+            id: 5, productID: "pro.monthly", purchased: now.addingTimeInterval(-30 * 86_400), expires: now.addingTimeInterval(-3_600))
+        await h.store.setEntitlements([lapsed])
+        await h.store.setGraceEnd(graceEnd)
+        await h.start()
+        guard case .subscribed(let subscription) = h.engine.entitlement else {
+            Issue.record("expected a subscription in grace, got \(h.engine.entitlement)")
+            return
+        }
+        #expect(subscription.phase == .inGracePeriod && subscription.gracePeriodEndsAt == graceEnd)
+        #expect(h.engine.canPass(.paid) && h.engine.canPass(.tokens(5)))
+        #expect(h.clock.pendingSleepers == 1, "one expiry timer, for the grace end")
+        h.clock.advance(by: 15 * 86_400)
+        await Task.yield()
+        #expect(h.engine.entitlement.isPaying)
+        #expect(!h.events.contains { if case .entitlementChanged(_, .free, .expiryTimer) = $0 { true } else { false } })
+        // Billing never recovered: at the grace end the subscription lapses, through the timer.
+        h.clock.advance(by: 86_400)
+        #expect(await eventually { h.engine.entitlement == .free })
+        #expect(h.events.contains { if case .entitlementChanged(.subscribed, .free, .expiryTimer) = $0 { true } else { false } })
+        #expect(!h.engine.canPass(.paid))
+        // The grace read fails offline: the lapsed row is free, as before grace was modelled; online it counts again.
+        await h.store.setGraceEnd(h.clock.now.addingTimeInterval(20 * 86_400))
+        await h.store.setNetwork(false)
+        await h.engine.refresh(cause: .foreground)
+        #expect(h.engine.entitlement == .free)
+        await h.store.setNetwork(true)
+        await h.engine.refresh(cause: .foreground)
+        #expect(h.engine.entitlement.isPaying, "back online, the grace the store reports counts again")
     }
 
     // MARK: Sync
@@ -467,6 +629,16 @@ struct GateEngineTests {
         let reinstalled = try Harness(sync: sync)
         await reinstalled.start()
         #expect(reinstalled.engine.wallet.balance == 6)
+        // A1: the balance holds across launches, not only the first one after the reinstall.
+        for _ in 0..<2 {
+            try await reinstalled.relaunch()
+            await reinstalled.engine.syncNow()
+            #expect(reinstalled.engine.wallet.balance == 6)
+        }
+        _ = reinstalled.engine.run(.tokens(1), source: source("y")) {}
+        try await reinstalled.relaunch()
+        #expect(reinstalled.engine.wallet.balance == 5)
+        #expect(reinstalled.engine.canPass(.tokens(5)))
     }
 
     // MARK: Audit

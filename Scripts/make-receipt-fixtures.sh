@@ -4,11 +4,18 @@
 # The signatures use the layout of real receipts (PKCS#7 SignedData, no signed attributes, RSA PKCS#1 v1.5 over
 # the payload) plus the variants the verifier must also accept or refuse. Keys are discarded; only the root
 # certificate and the receipts are kept. Needs openssl 3.4+ (for -not_before/-not_after) and python3.
+#
+# Every receipt carries the device binding of Apple's validation guide: field 4 (an opaque value) and field 5, the
+# SHA-1 of the device's identifierForVendor bytes, field 4 and field 2 as encoded. The fixtures are bound to
+# FIXTURE_DEVICE (what the tests pass as the device identifier); receipt-other-device.der is bound to another
+# identifier and receipt-no-device-hash.der carries no field 4 or 5.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 OUT="Tests/PaywallKitTests/Fixtures"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
+FIXTURE_DEVICE="6F1A2B3C-4D5E-4F60-8172-93A4B5C6D7E8"
+OTHER_DEVICE="00000000-0000-4000-8000-00000000BEEF"
 
 cat > "$WORK/ext.cnf" <<'CNF'
 [ req ]
@@ -58,10 +65,11 @@ cert leaf-expired "/CN=ZTron Test Receipt Signing 2015/O=ZTronPaywallKit fixture
 cert leaf-nomarker "/CN=ZTron Test Other Signing/O=ZTronPaywallKit fixtures" v3_leaf_nomarker int 20240101000000Z 20340101000000Z
 
 # The receipt payload: SET OF SEQUENCE { type INTEGER, version INTEGER, value OCTET STRING }, Apple's field numbers.
-payload() { # out bundle creation_date_or_empty
-  python3 -I - "$1" "$2" "$3" <<'PY'
-import sys
-out, bundle, created = sys.argv[1:4]
+# `device` is the identifierForVendor the hash binds to, or "none" for a receipt without fields 4 and 5.
+payload() { # out bundle creation_date_or_empty device
+  python3 -I - "$1" "$2" "$3" "$4" <<'PY'
+import hashlib, sys, uuid
+out, bundle, created, device = sys.argv[1:5]
 def tlv(tag, body):
     n = len(body)
     if n < 0x80: length = bytes([n])
@@ -70,7 +78,12 @@ def tlv(tag, body):
     return bytes([tag]) + length + body
 def attr(kind, value): return tlv(0x30, tlv(0x02, bytes([kind])) + tlv(0x02, b"\x01") + tlv(0x04, value))
 utf8 = lambda s: tlv(0x0C, s.encode()); ia5 = lambda s: tlv(0x16, s.encode())
-attrs = [attr(0, utf8("Production")), attr(2, utf8(bundle)), attr(18, ia5("2024-03-01T10:00:00Z")), attr(19, utf8("116"))]
+bundle_der = utf8(bundle)
+attrs = [attr(0, utf8("Production")), attr(2, bundle_der), attr(18, ia5("2024-03-01T10:00:00Z")), attr(19, utf8("116"))]
+if device != "none":
+    opaque = bytes(range(16))  # field 4: an opaque value Apple generates; any bytes, bound by the hash
+    digest = hashlib.sha1(uuid.UUID(device).bytes + opaque + bundle_der).digest()
+    attrs += [attr(4, opaque), attr(5, digest)]
 if created: attrs.append(attr(12, ia5(created)))
 open(out, "wb").write(tlv(0x31, b"".join(attrs)))
 PY
@@ -83,10 +96,12 @@ sign() { # out leaf payload extra-openssl-args...
 }
 
 mkdir -p "$OUT"
-payload "$WORK/payload.der" com.ztron.app 2026-01-15T12:00:00Z
-payload "$WORK/payload-2015.der" com.ztron.app 2015-06-01T12:00:00Z
-payload "$WORK/payload-undated.der" com.ztron.app ""
-payload "$WORK/payload-other.der" com.other.app 2026-01-15T12:00:00Z
+payload "$WORK/payload.der" com.ztron.app 2026-01-15T12:00:00Z "$FIXTURE_DEVICE"
+payload "$WORK/payload-2015.der" com.ztron.app 2015-06-01T12:00:00Z "$FIXTURE_DEVICE"
+payload "$WORK/payload-undated.der" com.ztron.app "" "$FIXTURE_DEVICE"
+payload "$WORK/payload-other.der" com.other.app 2026-01-15T12:00:00Z "$FIXTURE_DEVICE"
+payload "$WORK/payload-other-device.der" com.ztron.app 2026-01-15T12:00:00Z "$OTHER_DEVICE"
+payload "$WORK/payload-no-device.der" com.ztron.app 2026-01-15T12:00:00Z none
 
 sign receipt-sha256.der leaf "$WORK/payload.der" -noattr -md sha256          # Apple's layout today
 sign receipt-sha1.der leaf "$WORK/payload.der" -noattr -md sha1              # receipts signed before 2023
@@ -95,6 +110,8 @@ sign receipt-expired-leaf.der leaf-expired "$WORK/payload-2015.der" -noattr -md 
 sign receipt-expired-leaf-undated.der leaf-expired "$WORK/payload-undated.der" -noattr -md sha256
 sign receipt-nomarker.der leaf-nomarker "$WORK/payload.der" -noattr -md sha256
 sign receipt-other-bundle.der leaf "$WORK/payload-other.der" -noattr -md sha256
+sign receipt-other-device.der leaf "$WORK/payload-other-device.der" -noattr -md sha256   # another device's genuine receipt
+sign receipt-no-device-hash.der leaf "$WORK/payload-no-device.der" -noattr -md sha256    # no field 4 or 5 at all
 openssl x509 -in "$WORK/root.pem" -outform DER -out "$OUT/test-root.der"
 
 for f in "$OUT"/receipt-*.der; do

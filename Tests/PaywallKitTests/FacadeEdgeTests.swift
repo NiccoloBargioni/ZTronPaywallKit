@@ -65,6 +65,7 @@
             _ = paywall.evaluate(.paid, id: "heatmap")  // fallback scheduled for the end of the turn
             let (_, store, clock) = await makePaywall()
             var configuration = Paywall.Configuration(catalog: catalog)
+            configuration.fileKeyStore = InMemoryFileKeyStore()
             configuration.store = store
             configuration.clock = clock
             configuration.connectivity = nil

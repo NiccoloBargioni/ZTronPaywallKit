@@ -50,9 +50,13 @@ struct TierTests {
         await h.engine.refresh(cause: .update)
         #expect(h.engine.tier == .yearly)
         #expect((h.engine.tier ?? .free) > .tokens)
-        let offline = try Harness()
-        await offline.store.setReachable(false)
-        await offline.start()
-        #expect(offline.engine.tier == nil)
+        let unanswered = try Harness()
+        await unanswered.store.setReachable(false)
+        let started = Task { await unanswered.start() }
+        #expect(await eventually { await unanswered.store.pendingReads == 1 })
+        #expect(unanswered.engine.tier == nil)
+        await unanswered.store.setReachable(true)
+        await started.value
+        #expect(unanswered.engine.tier == .free)
     }
 }

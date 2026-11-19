@@ -6,6 +6,11 @@ import Testing
 
 @testable import PaywallKit
 
+/// The identifier the committed fixtures are bound to (`Scripts/make-receipt-fixtures.sh`), and the one
+/// `receipt-other-device.der` is bound to.
+let fixtureDevice = UUID(uuidString: "6F1A2B3C-4D5E-4F60-8172-93A4B5C6D7E8")!
+let otherFixtureDevice = UUID(uuidString: "00000000-0000-4000-8000-00000000BEEF")!
+
 /// A tiny DER writer for synthetic receipts and containers.
 enum DER {
     static func tlv(_ tag: UInt8, _ body: [UInt8]) -> [UInt8] {
@@ -32,6 +37,21 @@ enum DER {
     static let rsa: [UInt8] = oid([0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01])
 
     static func attribute(_ type: Int, _ value: [UInt8]) -> [UInt8] { seq(int(type), int(1), octets(value)) }
+
+    /// The opaque value of field 4: Apple generates it; the fixtures use these sixteen bytes.
+    static let opaque: [UInt8] = Array(0..<16)
+
+    /// Field 5 of Apple's guide: SHA-1 of the device identifier's bytes, the opaque value and field 2 as encoded.
+    static func deviceHash(bundle: [UInt8], identifier: UUID, opaque: [UInt8] = DER.opaque) -> [UInt8] {
+        let u = identifier.uuid
+        let bytes: [UInt8] = [u.0, u.1, u.2, u.3, u.4, u.5, u.6, u.7, u.8, u.9, u.10, u.11, u.12, u.13, u.14, u.15]
+        return Array(Insecure.SHA1.hash(data: Data(bytes + opaque + bundle)))
+    }
+
+    /// Fields 4 and 5, binding a receipt for `bundle` (the UTF8String DER of field 2) to `identifier`.
+    static func deviceFields(bundle: [UInt8], identifier: UUID, opaque: [UInt8] = DER.opaque) -> [[UInt8]] {
+        [attribute(4, opaque), attribute(5, deviceHash(bundle: bundle, identifier: identifier, opaque: opaque))]
+    }
 
     /// ContentInfo { oid, [0] SignedData { version, digestAlgs, encap { oid, [0] OCTET STRING payload },
     ///                                     certs?, crls?, signerInfos } }
@@ -60,17 +80,58 @@ enum DER {
         body += seq(algorithm) + octets(signature)
         return tlv(0x30, body)
     }
+
+    /// SEQUENCEs nested `levels` deep with definite lengths, emitted front to back from precomputed sizes, so a
+    /// 20 000-level nest costs its own size to build.
+    static func definiteNest(levels: Int) -> [UInt8] {
+        var sizes = [2]  // the innermost `30 00`
+        for _ in 1..<max(levels, 1) { sizes.append(sizes[sizes.count - 1] + header(sizes[sizes.count - 1]).count) }
+        var out: [UInt8] = []
+        out.reserveCapacity(sizes[sizes.count - 1])
+        for level in stride(from: levels - 1, through: 1, by: -1) { out += header(sizes[level - 1]) }
+        return out + [0x30, 0x00]
+    }
+
+    static func header(_ contentLength: Int) -> [UInt8] {
+        switch contentLength {
+        case ..<0x80: return [0x30, UInt8(contentLength)]
+        case ..<0x100: return [0x30, 0x81, UInt8(contentLength)]
+        case ..<0x1_0000: return [0x30, 0x82, UInt8(contentLength >> 8), UInt8(contentLength & 0xFF)]
+        default: return [0x30, 0x83, UInt8(contentLength >> 16), UInt8((contentLength >> 8) & 0xFF), UInt8(contentLength & 0xFF)]
+        }
+    }
 }
 
 struct Accepting: ReceiptVerifier { func isAuthentic(_ receipt: Data) -> Bool { true } }
 struct Rejecting: ReceiptVerifier { func isAuthentic(_ receipt: Data) -> Bool { false } }
 
+let receiptBundle = DER.utf8("com.ztron.app")
+
+/// Type, bundle id, original version, original purchase date, then the device binding (fields 4 and 5).
 let receiptFields = [
     DER.attribute(0, DER.utf8("Production")),
-    DER.attribute(2, DER.utf8("com.ztron.app")),
+    DER.attribute(2, receiptBundle),
     DER.attribute(19, DER.utf8("116")),
     DER.attribute(18, DER.ia5("2024-03-01T10:00:00Z")),
-]
+] + DER.deviceFields(bundle: receiptBundle, identifier: fixtureDevice)
+
+/// Build 116 was the last paid one; the fixtures' purchase date (2024-03-01) is inside the paid window.
+let policy116 = GrandfatheringPolicy(
+    lastPaidBuild: "116", paidWindow: DateInterval(start: Date(timeIntervalSince1970: 1_600_000_000), end: Date(timeIntervalSince1970: 1_710_000_000)))
+
+func receiptClient(_ url: URL?, verifier: any ReceiptVerifier = Accepting(), bundle: String? = nil, device: UUID? = fixtureDevice) -> ReceiptClient {
+    ReceiptClient(receiptURL: url, verifier: verifier, expectedBundleID: bundle, deviceIdentifier: { device })
+}
+
+func writeReceipt(_ data: Data) throws -> URL {
+    let url = makeTemporaryPaywallDirectory().appendingPathComponent("receipt")
+    try data.write(to: url)
+    return url
+}
+
+/// Parses on the cooperative pool, whose threads have the smallest stacks the parse will ever run on.
+@concurrent
+private func parsesOffMain(_ bytes: [UInt8]) async -> Bool { ASN1.parse(bytes[...]) != nil }
 
 @Suite("Receipt (iOS 15 path)")
 struct ReceiptClientTests {
@@ -90,12 +151,73 @@ struct ReceiptClientTests {
         #expect(snapshot.originalAppVersion == "116")
     }
 
-    @Test func sandbox_receipt_type_maps_to_sandbox() throws {
-        var sandbox = fields
-        sandbox[0] = DER.attribute(0, DER.utf8("ProductionSandbox"))
-        #expect(try ReceiptClient.parse(DER.receipt(fields: sandbox))?.environment == .sandbox)
-        sandbox[0] = DER.attribute(0, DER.utf8("Xcode"))
-        #expect(try ReceiptClient.parse(DER.receipt(fields: sandbox))?.environment == .xcode)
+    /// B2: Apple's receipt types, exactly. No prefix match: `ProductionStub` is not production.
+    @Test(arguments: [
+        ("Production", StoreEnvironment.production), ("ProductionVPP", .production),
+        ("ProductionSandbox", .sandbox), ("ProductionVPPSandbox", .sandbox), ("Sandbox", .sandbox),
+        ("Xcode", .xcode), ("ProductionStub", .xcode), ("production", .xcode), ("Production ", .xcode), ("", .xcode),
+    ])
+    func receipt_types_map_exactly(type: String, environment: StoreEnvironment) throws {
+        #expect(ReceiptClient.environment(ofReceiptType: type) == environment)
+        var typed = fields
+        typed[0] = DER.attribute(0, DER.utf8(type))
+        #expect(try ReceiptClient.parse(DER.receipt(fields: typed))?.environment == environment)
+    }
+
+    @Test func a_missing_type_is_xcode_and_the_default_policy_refuses_it() throws {
+        #expect(ReceiptClient.environment(ofReceiptType: nil) == .xcode)
+        let untyped = try #require(try ReceiptClient.parse(DER.receipt(fields: Array(fields[1...]))))
+        #expect(untyped.environment == .xcode)
+        #expect(!policy116.admits(untyped))
+    }
+
+    /// B2: the VPP receipts examined so far carry no original version or purchase date, and fail closed before
+    /// the type is even read. One with a history would be a production purchase like any other.
+    @Test func vpp_receipt_without_purchase_history_fails_closed() async throws {
+        var vpp = fields
+        vpp[0] = DER.attribute(0, DER.utf8("ProductionVPP"))
+        var observed = vpp
+        observed[2] = DER.attribute(19, DER.utf8(""))
+        observed[3] = DER.attribute(18, DER.ia5(""))
+        #expect(try ReceiptClient.parse(DER.receipt(fields: observed)) == nil)
+        #expect(try ReceiptClient.parse(DER.receipt(fields: [vpp[0], vpp[1], vpp[4], vpp[5]])) == nil)  // 18 and 19 absent
+        #expect(try await receiptClient(try writeReceipt(DER.receipt(fields: observed))).snapshot() == nil)
+        let full = try #require(try ReceiptClient.parse(DER.receipt(fields: vpp)))
+        #expect(full.environment == .production)
+        #expect(policy116.admits(full))
+    }
+
+    /// B2: an empty version is no version, in the parser and in the rule (where "" would sort below every build and
+    /// skip the "1.0" sentinel).
+    @Test func empty_original_version_is_never_admitted() throws {
+        var empty = fields
+        empty[2] = DER.attribute(19, DER.utf8(""))
+        #expect(try ReceiptClient.parse(DER.receipt(fields: empty)) == nil)
+        var emptyBundle = fields
+        emptyBundle[1] = DER.attribute(2, DER.utf8(""))
+        #expect(try ReceiptClient.parse(DER.receipt(fields: emptyBundle)) == nil)
+        let blank = AppTransactionSnapshot(
+            bundleID: "com.ztron.app", originalAppVersion: "", originalPurchaseDate: Date(timeIntervalSince1970: 1_700_000_000),
+            environment: .production, origin: .appTransaction)
+        #expect(!policy116.admits(blank))
+        var sentinelPolicy = policy116
+        sentinelPolicy.legacySentinel = .init(onSaleWindow: policy116.paidWindow)
+        #expect(!sentinelPolicy.admits(blank))
+    }
+
+    /// B2: the Volume Purchase expiration (field 21). A receipt past it is no purchase; before it, it is one.
+    @Test func a_receipt_past_its_volume_purchase_expiration_fails_closed() async throws {
+        let expiry = DER.attribute(21, DER.ia5("2026-06-01T00:00:00Z"))
+        let url = try writeReceipt(DER.receipt(fields: fields + [expiry]))
+        let before = ISO8601DateFormatter().date(from: "2026-05-31T23:59:59Z")!
+        #expect(try await receiptClient(url).snapshot(now: before) != nil)
+        #expect(try await receiptClient(url).snapshot(now: before.addingTimeInterval(1)) == nil)  // at the second: gone
+        #expect(try await receiptClient(url).snapshot(now: before.addingTimeInterval(86_400)) == nil)
+        #expect(try ReceiptClient.parse(DER.receipt(fields: fields + [expiry])) != nil, "parse has no clock")
+        // A verified receipt whose expiration this build cannot read is Apple's output in a format we do not know,
+        // not a forgery: it is honoured, like one without the field.
+        let unreadable = try writeReceipt(DER.receipt(fields: fields + [DER.attribute(21, DER.ia5("soon"))]))
+        #expect(try await receiptClient(unreadable).snapshot() != nil)
     }
 
     @Test func receipt_without_field_19_18_or_2_fails_closed() throws {
@@ -119,17 +241,83 @@ struct ReceiptClientTests {
         #expect(throws: ReceiptClient.ReceiptError.malformed) { try ReceiptClient.parse(notSigned) }
     }
 
-    @Test func missing_unverified_foreign_or_unverifiable_receipts_fail_closed() throws {
+    @Test func missing_unverified_foreign_or_unverifiable_receipts_fail_closed() async throws {
         let url = makeTemporaryPaywallDirectory().appendingPathComponent("receipt")
-        #expect(try ReceiptClient(receiptURL: url, verifier: Accepting(), expectedBundleID: nil).snapshot() == nil)  // missing
+        #expect(try await receiptClient(url).snapshot() == nil)  // missing
         try DER.receipt(fields: fields).write(to: url)
-        #expect(try ReceiptClient(receiptURL: url, verifier: Rejecting(), expectedBundleID: nil).snapshot() == nil)
-        #expect(try ReceiptClient(receiptURL: url, verifier: Accepting(), expectedBundleID: nil).snapshot()?.originalAppVersion == "116")
-        #expect(try ReceiptClient(receiptURL: url, verifier: Accepting(), expectedBundleID: "com.ztron.app").snapshot() != nil)
-        #expect(try ReceiptClient(receiptURL: url, verifier: Accepting(), expectedBundleID: "com.someone.else").snapshot() == nil)
-        #expect(try ReceiptClient(receiptURL: nil, verifier: Accepting()).snapshot() == nil)
-        // The default client fails closed on a receipt Apple did not sign.
-        #expect(try ReceiptClient(receiptURL: url).snapshot() == nil)
+        #expect(try await receiptClient(url, verifier: Rejecting()).snapshot() == nil)
+        #expect(try await receiptClient(url).snapshot()?.originalAppVersion == "116")
+        #expect(try await receiptClient(url, bundle: "com.ztron.app").snapshot() != nil)
+        #expect(try await receiptClient(url, bundle: "com.someone.else").snapshot() == nil)
+        #expect(try await receiptClient(nil).snapshot() == nil)
+        // The default client fails closed on a receipt Apple did not sign, whatever device it names.
+        #expect(try await ReceiptClient(receiptURL: url, deviceIdentifier: { fixtureDevice }).snapshot() == nil)
+    }
+
+    /// A11+B6: field 5 binds the receipt to the device that bought it. The fixture identifier passes; another
+    /// identifier, none at all, or a receipt without the two fields never does.
+    @Test func the_receipt_is_bound_to_this_device() async throws {
+        let url = try writeReceipt(DER.receipt(fields: fields))
+        #expect(try await receiptClient(url).snapshot() != nil)
+        #expect(try await receiptClient(url, device: otherFixtureDevice).snapshot() == nil)
+        #expect(try await receiptClient(url, device: UUID()).snapshot() == nil)
+        #expect(try await receiptClient(url, device: nil).snapshot() == nil, "no identifier (before first unlock): no snapshot")
+        // Another device's receipt, planted here, is that device's and nobody else's.
+        let base = Array(fields.prefix(4))
+        let strangers = try writeReceipt(DER.receipt(fields: base + DER.deviceFields(bundle: receiptBundle, identifier: otherFixtureDevice)))
+        #expect(try await receiptClient(strangers).snapshot() == nil)
+        #expect(try await receiptClient(strangers, device: otherFixtureDevice).snapshot() != nil)
+        // No fields 4 and 5; only field 4; only field 5; a hash of the wrong length; a hash over the bundle id's
+        // bytes instead of field 2 as encoded; a hash over another opaque value.
+        let variants: [[[UInt8]]] = [
+            base, base + [fields[4]], base + [fields[5]], base + [fields[4], DER.attribute(5, [UInt8](repeating: 0, count: 19))],
+            base + DER.deviceFields(bundle: Array("com.ztron.app".utf8), identifier: fixtureDevice),
+            base + [fields[4], DER.attribute(5, DER.deviceHash(bundle: receiptBundle, identifier: fixtureDevice, opaque: [1]))],
+        ]
+        for variant in variants {
+            #expect(try await receiptClient(try writeReceipt(DER.receipt(fields: variant))).snapshot() == nil)
+        }
+        // The pure parse never looks at the device; the device check is the client's.
+        #expect(try ReceiptClient.parse(DER.receipt(fields: base)) != nil)
+        #expect(!ReceiptClient.matchesDevice([:], identifier: fixtureDevice))
+        #expect(ReceiptClient.matchesDevice(try ReceiptClient.receiptFields(DER.receipt(fields: fields)), identifier: fixtureDevice))
+        #expect(!ReceiptClient.matchesDevice(try ReceiptClient.receiptFields(DER.receipt(fields: fields)), identifier: otherFixtureDevice))
+    }
+
+    /// The identifier the production client binds to: `identifierForVendor` where UIKit is, nothing elsewhere.
+    @Test func the_platform_identifier_is_the_vendor_one_on_ios_and_none_elsewhere() async throws {
+        #if canImport(UIKit) && !os(watchOS)
+            #expect(await ReceiptClient.vendorIdentifier() != nil)
+        #else
+            #expect(await ReceiptClient.vendorIdentifier() == nil)
+            let url = try writeReceipt(DER.receipt(fields: fields))
+            #expect(try await ReceiptClient(receiptURL: url, verifier: Accepting(), expectedBundleID: nil).snapshot() == nil)
+        #endif
+    }
+
+    /// B9: nesting is bounded at `ASN1.maxDepth` and refused there, before a crafted container costs anything. The
+    /// parses run on the cooperative pool, whose threads have the smallest stacks the receipt path will ever see.
+    @Test func nesting_is_refused_at_the_bound() async throws {
+        var open: [UInt8] = []  // never closed
+        for _ in 0..<100_000 { open += [0x30, 0x80] }
+        let indefinite: [UInt8] = open + [UInt8](repeating: 0, count: 200_000)  // closed 100 000 times
+        let definite = DER.definiteNest(levels: 20_000)
+        #expect(definite.count > 60_000)
+        let real = AppleReceiptVerifier(anchors: [ReceiptSignatureTests.testRoot])
+        for crafted in [open, indefinite, definite] {
+            #expect(await parsesOffMain(crafted) == false)
+            let data = Data(crafted)
+            #expect(!real.isAuthentic(data))
+            #expect(throws: ReceiptClient.ReceiptError.malformed) { try ReceiptClient.parse(data) }
+            let url = try writeReceipt(data)
+            #expect(try await receiptClient(url, verifier: real).snapshot() == nil)
+            await #expect(throws: ReceiptClient.ReceiptError.malformed) { try await receiptClient(url).snapshot() }
+        }
+        #expect(await parsesOffMain(DER.definiteNest(levels: ASN1.maxDepth)))
+        #expect(await parsesOffMain(DER.definiteNest(levels: ASN1.maxDepth + 1)) == false)
+        #expect(ASN1.parse(DER.definiteNest(levels: ASN1.maxDepth)[...])?.children.count == 1)
+        #expect(ASN1.parse(DER.definiteNest(levels: 1)[...])?.children.isEmpty == true)
+        #expect(ASN1.parse([0x30, 0x80, 0x30, 0x00, 0x00, 0x00][...])?.children.count == 1)
     }
 
     @Test func asn1_integers_strings_and_object_identifiers() {
@@ -157,9 +345,12 @@ struct ReceiptClientTests {
         let constructed = ASN1.parse([0x24, 0x80, 0x04, 0x01, 0x41, 0x04, 0x01, 0x42, 0x00, 0x00][...])
         #expect(constructed?.octetBytes == [0x41, 0x42])
         #expect(constructed?.raw.count == 10)
+        // Nodes are slices of the input: a child's raw bytes sit inside its parent's.
+        let parent = ASN1.parse([0x30, 0x05, 0x04, 0x03, 0x01, 0x02, 0x03][...])
+        #expect(parent?.child(0)?.raw.startIndex == 2 && parent?.child(0)?.raw.endIndex == 7)
     }
 
-    @Test func signed_data_model_skips_crls_and_refuses_the_wrong_shape() {
+    @Test func signed_data_model_skips_crls_and_refuses_the_wrong_shape() throws {
         let withCRLs = DER.receipt(fields: fields, certificates: [], crls: true, signers: [DER.signer()])
         let model = SignedReceipt(withCRLs)
         #expect(model?.signers.count == 1)
@@ -174,6 +365,28 @@ struct ReceiptClientTests {
         #expect(SignedReceipt(noSignerSet) == nil)
         #expect(SignedReceipt(Data([0x30, 0x00]))?.signers == nil)
         #expect(SignedReceipt(Data(DER.seq(DER.pkcs7Data, DER.tlv(0xA0, [])))) == nil)
+        // A signer whose signature is an INTEGER, not an OCTET STRING, is dropped too.
+        let integerSignature = DER.tlv(0x30, DER.int(1) + DER.seq(DER.seq(DER.utf8("issuer")), DER.int(7)) + DER.seq(DER.sha256) + DER.seq(DER.rsa) + DER.int(5))
+        #expect(SignedReceipt(DER.receipt(fields: fields, signers: [integerSignature]))?.signers.isEmpty == true)
+        // A payload that is not DER has no fields, so the receipt parses to nothing; an attribute too short to be one
+        // is skipped.
+        let garbagePayload = Data(DER.seq(DER.signedData, DER.tlv(0xA0, DER.seq(DER.int(1), DER.set([]), DER.seq(DER.pkcs7Data, DER.tlv(0xA0, DER.octets([0x30, 0x05]))), DER.set([])))))
+        #expect(SignedReceipt(garbagePayload)?.fields.isEmpty == true)
+        #expect(try ReceiptClient.parse(garbagePayload) == nil)
+        // Every way the container can stop short of its payload: no SignedData, an empty one, no encapsulated content,
+        // content without the explicit tag, an explicit tag with nothing inside.
+        for truncated in [
+            DER.seq(DER.signedData),
+            DER.seq(DER.signedData, DER.tlv(0xA0, [])),
+            DER.seq(DER.signedData, DER.tlv(0xA0, DER.seq(DER.int(1), DER.set([])))),
+            DER.seq(DER.signedData, DER.tlv(0xA0, DER.seq(DER.int(1), DER.set([]), DER.seq(DER.pkcs7Data)))),
+            DER.seq(DER.signedData, DER.tlv(0xA0, DER.seq(DER.int(1), DER.set([]), DER.seq(DER.pkcs7Data, DER.tlv(0xA0, []))))),
+        ] {
+            #expect(SignedReceipt(Data(truncated)) == nil)
+            #expect(throws: ReceiptClient.ReceiptError.malformed) { try ReceiptClient.parse(Data(truncated)) }
+        }
+        #expect(try ReceiptClient.parse(DER.receipt(fields: fields + [DER.seq(DER.int(19), DER.int(1))]))?.originalAppVersion == "116")
+        #expect(ASN1.string([]) == nil && ASN1.string([0x0C]) == nil)
     }
 }
 
@@ -199,18 +412,78 @@ struct ReceiptSignatureTests {
     }
 
     @Test(arguments: ["receipt-sha256", "receipt-sha1", "receipt-attrs"])
-    func every_accepted_layout_verifies_and_parses(name: String) throws {
+    func every_accepted_layout_verifies_and_parses(name: String) async throws {
         let receipt = try Self.fixture(name)
         #expect(verifier.isAuthentic(receipt))
-        let url = makeTemporaryPaywallDirectory().appendingPathComponent("receipt")
-        try receipt.write(to: url)
-        let snapshot = try ReceiptClient(receiptURL: url, verifier: verifier, expectedBundleID: "com.ztron.app").snapshot()
+        let snapshot = try await receiptClient(try writeReceipt(receipt), verifier: verifier, bundle: "com.ztron.app").snapshot()
         #expect(snapshot?.originalAppVersion == "116")
         #expect(snapshot?.environment == .production)
         #expect(snapshot?.accountKey == AppTransactionSnapshot(
             bundleID: "com.ztron.app", originalAppVersion: "116",
             originalPurchaseDate: ISO8601DateFormatter().date(from: "2024-03-01T10:00:00Z")!, environment: .production,
             origin: .receipt).accountKey)
+        // The fixture's binding is what the script says it is.
+        let fields = try ReceiptClient.receiptFields(receipt)
+        #expect(fields[4] == DER.opaque)
+        #expect(fields[5] == DER.deviceHash(bundle: receiptBundle, identifier: fixtureDevice))
+    }
+
+    /// A11+B6: a genuine receipt of another device, or one with no device binding, verifies and is still refused.
+    @Test func a_receipt_bound_to_another_device_or_to_none_verifies_but_is_refused() async throws {
+        let strangers = try Self.fixture("receipt-other-device")
+        #expect(verifier.isAuthentic(strangers))
+        let strangersURL = try writeReceipt(strangers)
+        #expect(try await receiptClient(strangersURL, verifier: verifier, bundle: "com.ztron.app").snapshot() == nil)
+        #expect(try await receiptClient(strangersURL, verifier: verifier, bundle: "com.ztron.app", device: otherFixtureDevice).snapshot()?.originalAppVersion == "116")
+        let unbound = try Self.fixture("receipt-no-device-hash")
+        #expect(verifier.isAuthentic(unbound))
+        #expect(try ReceiptClient.parse(unbound)?.originalAppVersion == "116", "the pure parse still reads it")
+        for device in [fixtureDevice, otherFixtureDevice, UUID(), nil] {
+            #expect(try await receiptClient(try writeReceipt(unbound), verifier: verifier, device: device).snapshot() == nil)
+        }
+        let mine = try writeReceipt(try Self.fixture("receipt-sha256"))
+        #expect(try await receiptClient(mine, verifier: verifier, device: UUID()).snapshot() == nil)
+        #expect(try await receiptClient(mine, verifier: verifier, device: nil).snapshot() == nil)
+    }
+
+    /// A11+B6 through the facade: a grandfather read from this device's receipt is cached and kept on a launch where
+    /// no identifier is available (the receipt answers nothing, the cache stands), and another install with a
+    /// stranger's genuine receipt planted in its container is granted nothing.
+    @MainActor
+    @Test func a_receipt_grandfather_is_kept_without_an_identifier_and_a_strangers_receipt_grants_nothing() async throws {
+        let mine = try writeReceipt(try Self.fixture("receipt-sha256"))
+        let strangers = try writeReceipt(try Self.fixture("receipt-other-device"))
+        func answer(_ url: URL, device: UUID?) async throws -> AppTransactionSnapshot? {
+            try await receiptClient(url, verifier: verifier, bundle: "com.ztron.app", device: device).snapshot()
+        }
+        let paywall = Paywall()
+        var configuration = Paywall.Configuration(catalog: catalog)
+        configuration.fileKeyStore = InMemoryFileKeyStore()
+        configuration.grandfathering = policy116
+        configuration.welcomeTokens = 0
+        configuration.storageDirectory = makeTemporaryPaywallDirectory()
+        configuration.includesDefaultAudit = false
+        configuration.connectivity = nil
+        configuration.store = FakeStore(app: try await answer(mine, device: fixtureDevice), products: products)
+        paywall.configure(configuration)
+        await paywall.waitUntilStarted()
+        await settle()
+        #expect(paywall.entitlement == .lifetime(.grandfathered(originalAppVersion: "116")))
+        #expect(paywall.canPass(.paid))
+        // Relaunch before first unlock: no identifier, so no snapshot, so the cached grandfather stands.
+        configuration.store = FakeStore(app: try await answer(mine, device: nil), products: products)
+        paywall.configure(configuration)
+        await paywall.waitUntilStarted()
+        await settle()
+        #expect(paywall.entitlement == .lifetime(.grandfathered(originalAppVersion: "116")))
+        // Another install, this device, a stranger's genuine receipt planted in the container.
+        configuration.storageDirectory = makeTemporaryPaywallDirectory()
+        configuration.store = FakeStore(app: try await answer(strangers, device: fixtureDevice), products: products)
+        paywall.configure(configuration)
+        await paywall.waitUntilStarted()
+        await settle()
+        #expect(paywall.entitlement == .free)
+        #expect(!paywall.canPass(.paid))
     }
 
     /// Apple rotates the signing certificate: a receipt is evaluated at its own creation date (field 12).
@@ -227,13 +500,13 @@ struct ReceiptSignatureTests {
         #expect(anyChained.isAuthentic(receipt))
     }
 
-    @Test func receipt_for_another_app_verifies_but_is_not_this_apps() throws {
+    @Test func receipt_for_another_app_verifies_but_is_not_this_apps() async throws {
         let receipt = try Self.fixture("receipt-other-bundle")
         #expect(verifier.isAuthentic(receipt))
-        let url = makeTemporaryPaywallDirectory().appendingPathComponent("receipt")
-        try receipt.write(to: url)
-        #expect(try ReceiptClient(receiptURL: url, verifier: verifier, expectedBundleID: "com.ztron.app").snapshot() == nil)
-        #expect(try ReceiptClient(receiptURL: url, verifier: verifier, expectedBundleID: nil).snapshot()?.bundleID == "com.other.app")
+        let url = try writeReceipt(receipt)
+        #expect(try await receiptClient(url, verifier: verifier, bundle: "com.ztron.app").snapshot() == nil)
+        // The hash covers field 2 as the other app's receipt encodes it, so the binding holds for that app's id.
+        #expect(try await receiptClient(url, verifier: verifier).snapshot()?.bundleID == "com.other.app")
     }
 
     @Test func tampering_with_the_payload_or_the_signature_is_refused() throws {
@@ -301,6 +574,8 @@ struct ReceiptSignatureTests {
         #expect(AppleReceiptVerifier.signedMessage(of: try signer(good), over: [9]) == nil)
         #expect(!AppleReceiptVerifier.hasExtension("1.2", in: [0x30, 0x00]))
         #expect(!AppleReceiptVerifier.hasExtension("1.2", in: DER.seq(DER.seq(DER.int(1)))))
+        #expect(!AppleReceiptVerifier.hasExtension("1.2", in: DER.seq(DER.seq(DER.int(1), DER.tlv(0xA3, [])))), "an empty extensions block")
+        #expect(!AppleReceiptVerifier.hasExtension("1.2", in: [0x30]))
     }
 
     @Test func embedded_apple_root_matches_the_published_fingerprint() {
@@ -317,12 +592,13 @@ struct ReceiptSignatureTests {
                 .filter { FileManager.default.fileExists(atPath: $0.path) }
         }()
 
-        /// Real receipts, signed by Apple's production chain. Purchase receipts (`Production`) verify and parse;
-        /// the `ProductionStub` receipts Apple ships with its bundled apps carry no original version and fail closed
-        /// in the parser (Apple also signs those with an already-expired certificate, so they are not asserted
-        /// authentic). Nothing on this machine chains to the test root.
+        /// Real receipts, signed by Apple's production chain. Purchase receipts (`Production`) verify, parse and
+        /// carry the device binding; the `ProductionStub` receipts Apple ships with its bundled apps carry no
+        /// original version and fail closed in the parser (Apple also signs those with an already-expired
+        /// certificate, so they are not asserted authentic). Nothing on this machine chains to the test root, and a
+        /// Mac receipt is bound to the Mac's GUID, which is not an `identifierForVendor`: no identifier matches it.
         @Test(.enabled(if: !macAppStoreReceipts.isEmpty, "no Mac App Store receipts on this machine"))
-        func every_mac_app_store_receipt_on_this_mac_verifies() throws {
+        func every_mac_app_store_receipt_on_this_mac_verifies() async throws {
             var purchases = 0
             for url in Self.macAppStoreReceipts {
                 let receipt = try Data(contentsOf: url)
@@ -336,6 +612,8 @@ struct ReceiptSignatureTests {
                     #expect(snapshot?.environment == .production, "\(url.path)")
                     #expect(snapshot?.bundleID.isEmpty == false, "\(url.path)")
                     #expect(snapshot?.originalAppVersion.isEmpty == false, "\(url.path)")
+                    #expect(model.fields[4] != nil && model.fields[5]?.count == 20, "\(url.path): no device binding")
+                    #expect(try await ReceiptClient(receiptURL: url, expectedBundleID: nil, deviceIdentifier: { UUID() }).snapshot() == nil)
                 default:
                     #expect(snapshot == nil, "\(url.path): a stub receipt must never grandfather")
                 }
@@ -345,13 +623,80 @@ struct ReceiptSignatureTests {
     #endif
 }
 
+/// The payload of an `AppTransaction` JWS (`VerificationResult<AppTransaction>.jwsRepresentation`), decoded the way
+/// `StoreKit2Client` maps the typed value: for comparing Apple's two sources for one install.
+enum AppTransactionJWS {
+    struct Payload: Decodable {
+        let bundleId: String
+        let originalApplicationVersion: String
+        let originalPurchaseDate: Double  // milliseconds since 1970
+        let receiptType: String
+        let appTransactionId: String?
+    }
+
+    static func snapshot(_ jws: String) -> AppTransactionSnapshot? {
+        let parts = jws.split(separator: ".")
+        guard parts.count == 3, let data = base64URL(String(parts[1])), let payload = try? JSONDecoder().decode(Payload.self, from: data)
+        else { return nil }
+        let environment: StoreEnvironment =
+            switch payload.receiptType {
+            case "Production": .production
+            case "Sandbox": .sandbox
+            default: .xcode
+            }
+        return AppTransactionSnapshot(
+            bundleID: payload.bundleId, originalAppVersion: payload.originalApplicationVersion,
+            originalPurchaseDate: Date(timeIntervalSince1970: payload.originalPurchaseDate / 1000), environment: environment,
+            appTransactionID: payload.appTransactionId.flatMap(StoreKit2Client.normalizedAppTransactionID), origin: .appTransaction,
+            signedPayload: Data(jws.utf8))
+    }
+
+    static func base64URL(_ string: String) -> Data? {
+        var base64 = string.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        while base64.count % 4 != 0 { base64 += "=" }
+        return Data(base64Encoded: base64)
+    }
+
+    /// A JWS with the given payload and an unverifiable signature: enough for the decoder.
+    static func make(_ payload: [String: Any]) -> String {
+        let json = try! JSONSerialization.data(withJSONObject: payload)
+        let segment = json.base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        return "eyJhbGciOiJFUzI1NiJ9.\(segment).c2ln"
+    }
+}
+
+@Suite("AppTransaction JWS decoding")
+struct AppTransactionJWSTests {
+    @Test func decodes_the_fields_the_key_and_the_mapping_use() throws {
+        let jws = AppTransactionJWS.make([
+            "bundleId": "com.ztron.app", "originalApplicationVersion": "116", "originalPurchaseDate": 1_709_287_200_600,
+            "receiptType": "Production", "appTransactionId": "",
+        ])
+        let snapshot = try #require(AppTransactionJWS.snapshot(jws))
+        #expect(snapshot.bundleID == "com.ztron.app" && snapshot.originalAppVersion == "116")
+        #expect(snapshot.originalPurchaseDate == Date(timeIntervalSince1970: 1_709_287_200.6))
+        #expect(snapshot.environment == .production && snapshot.origin == .appTransaction)
+        #expect(snapshot.appTransactionID == nil, "an empty id is no id, as in the client")
+        #expect(snapshot.signedPayload == Data(jws.utf8))
+        #expect(AppTransactionJWS.snapshot(AppTransactionJWS.make(["bundleId": "x", "originalApplicationVersion": "1", "originalPurchaseDate": 0, "receiptType": "Sandbox"]))?.environment == .sandbox)
+        #expect(AppTransactionJWS.snapshot(AppTransactionJWS.make(["bundleId": "x", "originalApplicationVersion": "1", "originalPurchaseDate": 0, "receiptType": "Xcode", "appTransactionId": "7"]))?.appTransactionID == "7")
+        #expect(AppTransactionJWS.snapshot("a.b") == nil)
+        #expect(AppTransactionJWS.snapshot("a.!!.c") == nil)
+    }
+}
+
 private let productionReceiptPath = ProcessInfo.processInfo.environment["PAYWALL_PRODUCTION_RECEIPT"]
+private let productionAppTransactionPath = ProcessInfo.processInfo.environment["PAYWALL_PRODUCTION_APP_TRANSACTION"]
+private let productionDeviceID = ProcessInfo.processInfo.environment["PAYWALL_PRODUCTION_DEVICE_ID"].flatMap(UUID.init(uuidString:))
 
 /// A production receipt of the app under test, when `PAYWALL_PRODUCTION_RECEIPT` names one. An App Store install
 /// keeps it at `Bundle.main.appStoreReceiptURL`; for an iOS app on an Apple silicon Mac that is
 /// `~/Library/Containers/<bundle id>/Data/StoreKit/receipt`. It is Apple's real output, so the verifier, the parser,
 /// the grandfathering rule and the engine run over it, with expectations taken from the receipt itself. A receipt
-/// names its app, so none is committed and CI skips the suite.
+/// names its app, so none is committed and CI skips the suite. `PAYWALL_PRODUCTION_DEVICE_ID` (the install's
+/// `identifierForVendor`) proves the device binding positively; `PAYWALL_PRODUCTION_APP_TRANSACTION` (a file holding
+/// the same install's `AppTransaction` JWS) proves the account-key parity of Apple's two sources.
 @Suite("Production receipt", .enabled(if: productionReceiptPath != nil, "set PAYWALL_PRODUCTION_RECEIPT to an App Store receipt file"))
 struct ProductionReceiptTests {
     static let day: TimeInterval = 86_400
@@ -390,7 +735,7 @@ struct ProductionReceiptTests {
         #expect(!AppleReceiptVerifier().isAuthentic(tampered))
     }
 
-    @Test func parses_what_the_rule_uses_and_the_client_binds_it_to_its_app() throws {
+    @Test func parses_what_the_rule_uses_and_the_client_binds_it_to_its_app_and_device() async throws {
         let receipt = try Self.receipt()
         let snapshot = try Self.snapshot()
         #expect(snapshot.environment == .production)
@@ -404,17 +749,36 @@ struct ProductionReceiptTests {
         #expect(fields[0].flatMap(ASN1.string) == "Production")
         let created = try #require(fields[12].flatMap(ASN1.string).flatMap(ReceiptClient.parseDate))  // the chain is evaluated at it
         #expect(created >= snapshot.originalPurchaseDate)
-        // The iOS 15 path and the iOS 16 path derive one account key from the same three values.
-        let fromAppTransaction = AppTransactionSnapshot(
-            bundleID: snapshot.bundleID, originalAppVersion: snapshot.originalAppVersion,
-            originalPurchaseDate: snapshot.originalPurchaseDate, environment: .production, appTransactionID: "1", origin: .appTransaction)
-        #expect(snapshot.accountKey == fromAppTransaction.accountKey)
-        // The client, with the production verifier, reads it for its app and for no other.
-        let url = makeTemporaryPaywallDirectory().appendingPathComponent("receipt")
-        try receipt.write(to: url)
-        #expect(try ReceiptClient(receiptURL: url, expectedBundleID: snapshot.bundleID).snapshot() == snapshot)
-        #expect(try ReceiptClient(receiptURL: url, expectedBundleID: "com.ztron.app").snapshot() == nil)
-        print("production receipt: \(snapshot.bundleID) build \(snapshot.originalAppVersion), bought \(snapshot.originalPurchaseDate), created \(created)")
+        // A11+B6: Apple bound it to the device that bought it (fields 4 and 5). Copied here, it is refused: a random
+        // identifier, or none, never matches; the install's own `identifierForVendor` does, when the lane names it.
+        #expect(fields[4] != nil && fields[5]?.count == 20)
+        let url = try writeReceipt(receipt)
+        #expect(try await ReceiptClient(receiptURL: url, expectedBundleID: snapshot.bundleID, deviceIdentifier: { UUID() }).snapshot() == nil)
+        #expect(try await ReceiptClient(receiptURL: url, expectedBundleID: snapshot.bundleID, deviceIdentifier: { nil }).snapshot() == nil)
+        #expect(!ReceiptClient.matchesDevice(fields, identifier: UUID()))
+        if let productionDeviceID {
+            #expect(ReceiptClient.matchesDevice(fields, identifier: productionDeviceID))
+            #expect(try await ReceiptClient(receiptURL: url, expectedBundleID: snapshot.bundleID, deviceIdentifier: { productionDeviceID }).snapshot() == snapshot)
+            #expect(try await ReceiptClient(receiptURL: url, expectedBundleID: "com.ztron.app", deviceIdentifier: { productionDeviceID }).snapshot() == nil)
+        }
+        print("production receipt: \(snapshot.bundleID) build \(snapshot.originalAppVersion), bought \(snapshot.originalPurchaseDate), created \(created), device \(productionDeviceID == nil ? "unnamed" : "matched")")
+    }
+
+    /// B13: the parity claim at `StoreClient.accountKey`, against Apple's two sources for one install. The receipt
+    /// path and the `AppTransaction` path must bind the same key, or the install's tokens would move between two
+    /// partitions whenever the source changes.
+    @Test(.enabled(if: productionAppTransactionPath != nil, "set PAYWALL_PRODUCTION_APP_TRANSACTION to a file holding the install's AppTransaction JWS"))
+    func the_same_installs_app_transaction_derives_the_receipts_account_key() throws {
+        let receipt = try Self.snapshot()
+        let jws = try String(contentsOf: URL(fileURLWithPath: try #require(productionAppTransactionPath)), encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let app = try #require(AppTransactionJWS.snapshot(jws), "not an AppTransaction JWS")
+        #expect(app.bundleID == receipt.bundleID)
+        #expect(app.originalAppVersion == receipt.originalAppVersion)
+        #expect(app.environment == receipt.environment)
+        #expect(floor(app.originalPurchaseDate.timeIntervalSince1970) == floor(receipt.originalPurchaseDate.timeIntervalSince1970))
+        #expect(app.accountKey == receipt.accountKey)
+        print("account key parity: receipt and AppTransaction agree on \(app.bundleID) build \(app.originalAppVersion)")
     }
 
     @Test func the_rule_admits_it_inside_the_paid_window_and_the_resolver_grants_from_it() throws {
@@ -456,6 +820,7 @@ struct ProductionReceiptTests {
         let paywall = Paywall()
         let audit = InMemoryAuditSink()
         var configuration = Paywall.Configuration(catalog: catalog)
+        configuration.fileKeyStore = InMemoryFileKeyStore()
         configuration.grandfathering = Self.policy(snapshot)
         configuration.welcomeTokens = 0
         configuration.store = FakeStore(app: snapshot, products: products)

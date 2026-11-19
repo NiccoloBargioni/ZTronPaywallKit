@@ -41,6 +41,9 @@ final class Harness {
     let audit: InMemoryAuditSink
     var settings: GateEngine.Settings
     let grandfathering: GrandfatheringPolicy?
+    /// The install's file key: the same bytes across relaunches, as the Keychain item would be. Tests that model a
+    /// launch with no key at hand set `fileKeyStore` to one built on `nil`.
+    var fileKeyStore: (any PaywallFileKeyStore)?
     private(set) var engine: GateEngine
     private(set) var events: [PaywallEvent] = []
 
@@ -53,7 +56,8 @@ final class Harness {
         promotionalOfferSigner: (any PromotionalOfferSigner)? = nil,
         audit: InMemoryAuditSink = InMemoryAuditSink(),
         settings: GateEngine.Settings = GateEngine.Settings(tolerance: 300, appVersion: "2.0", build: "200"),
-        grandfathering: GrandfatheringPolicy? = nil
+        grandfathering: GrandfatheringPolicy? = nil,
+        fileKeyStore: (any PaywallFileKeyStore)? = InMemoryFileKeyStore()
     ) throws {
         self.directory = directory
         self.store = store
@@ -64,9 +68,11 @@ final class Harness {
         self.audit = audit
         self.settings = settings
         self.grandfathering = grandfathering
+        self.fileKeyStore = fileKeyStore
         self.engine = try GateEngine(
             directory: directory, catalog: catalog, grandfathering: grandfathering, settings: settings, clock: clock,
-            store: store, promotionalOfferSigner: promotionalOfferSigner, sync: sync, connectivity: connectivity, audit: [audit])
+            store: store, promotionalOfferSigner: promotionalOfferSigner, sync: sync, connectivity: connectivity, audit: [audit],
+            fileKeyStore: fileKeyStore)
         engine.onEvent = { [weak self] in self?.events.append($0) }
     }
 
@@ -77,7 +83,8 @@ final class Harness {
         engine.shutdown()
         engine = try GateEngine(
             directory: directory, catalog: catalog, grandfathering: grandfathering, settings: settings, clock: clock,
-            store: store, promotionalOfferSigner: promotionalOfferSigner, sync: sync, connectivity: connectivity, audit: [audit])
+            store: store, promotionalOfferSigner: promotionalOfferSigner, sync: sync, connectivity: connectivity, audit: [audit],
+            fileKeyStore: fileKeyStore)
         events = []
         engine.onEvent = { [weak self] in self?.events.append($0) }
         if start { await engine.start() }

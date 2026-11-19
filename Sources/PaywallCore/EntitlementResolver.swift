@@ -21,7 +21,8 @@ public struct GrandfatheringPolicy: Hashable, Codable, Sendable {
     public var environments: Set<StoreEnvironment>
     /// `CFBundleVersion` of the last paid build (iOS), compared with `.numeric`.
     public var lastPaidBuild: String
-    /// First paid release ..< the day the freemium build goes live.
+    /// From the first paid release through the moment the freemium build goes live, both ends included
+    /// (`DateInterval.contains` is closed).
     public var paidWindow: DateInterval
     public var legacySentinel: Sentinel?
     public var grant: Grant
@@ -42,6 +43,8 @@ public struct GrandfatheringPolicy: Hashable, Codable, Sendable {
 
     /// The four conditions, against one snapshot whichever API produced it.
     public func admits(_ snapshot: AppTransactionSnapshot) -> Bool {
+        // 0. No version is no purchase history: an empty string would compare below every build and skip the sentinel.
+        guard !snapshot.originalAppVersion.isEmpty else { return false }
         // 1. Production only, by default: sandbox and TestFlight always report 1.0.
         guard environments.contains(snapshot.environment) else { return false }
         // 2. Numeric comparison: a string comparison gets "2" < "13" wrong.
@@ -81,7 +84,9 @@ public struct EntitlementResolution: Hashable, Sendable {
 }
 
 /// Pure: derives one `Entitlement` from verified transactions and the app transaction. Nothing else in the
-/// package decides who is paying, and its only inputs are store values (guideline 3.1.1).
+/// package decides who is paying. Its inputs are store values (guideline 3.1.1) and the clock `now`: whether a
+/// subscription has lapsed is judged against it, so a device clock set forward shows a subscriber as free until the
+/// next resolution, and one set back keeps a lapsed cached snapshot until the launch resolution.
 public struct EntitlementResolver: Sendable {
     public var catalog: ProductCatalog
     public var grandfathering: GrandfatheringPolicy?
@@ -93,16 +98,42 @@ public struct EntitlementResolver: Sendable {
         self.familySharing = familySharing
     }
 
+    /// A transaction that still counts for nothing but its expiry: not revoked, not upgraded, allowed by the family
+    /// sharing policy.
+    private func isLive(_ tx: StoreTransaction) -> Bool {
+        tx.revocationDate == nil && !tx.isUpgraded && (familySharing == .sharedEntitlements || tx.ownership == .purchased)
+    }
+
+    /// Whether `resolve` would need the grace end to decide: a subscription of the catalog is listed, lapsed, and
+    /// nothing else pays. During an App Store billing grace period StoreKit keeps listing the lapsed transaction,
+    /// whose `expirationDate` is the failed renewal date, and the grace end exists only in the renewal info.
+    public func needsGraceEnd(transactions: [StoreTransaction], now: Date) -> Bool {
+        let live = transactions.filter(isLive)
+        let paying = live.contains { tx in
+            (tx.productID == catalog.lifetimeProductID || catalog.tier(for: tx.productID) != nil)
+                && (tx.expirationDate.map { $0 > now } ?? true)
+        }
+        guard !paying else { return false }
+        return live.contains { tx in catalog.tier(for: tx.productID) != nil && (tx.expirationDate.map { $0 <= now } ?? false) }
+    }
+
+    /// `graceEnd`: the end of the group's billing grace period, when the store reported one. A lapsed subscription
+    /// StoreKit still lists stays subscribed, in phase `.inGracePeriod`, until then; without it a lapsed row is free,
+    /// which is also what a grace end in the past yields.
     public func resolve(
         transactions: [StoreTransaction],
         appTransaction: AppTransactionSnapshot?,
-        now: Date
+        now: Date,
+        graceEnd: Date? = nil
     ) -> EntitlementResolution {
         // 1. Drop revoked, expired and upgraded transactions, and family-shared ones the policy refuses. The
-        //    revocation filter is belt and braces.
+        //    revocation filter is belt and braces. A subscription that expired inside a grace period still in force
+        //    stays, with the grace end as its effective end.
+        let grace = graceEnd.flatMap { $0 > now ? $0 : nil }
         let live = transactions.filter { tx in
-            tx.revocationDate == nil && !tx.isUpgraded && (tx.expirationDate.map { $0 > now } ?? true)
-                && (familySharing == .sharedEntitlements || tx.ownership == .purchased)
+            guard isLive(tx) else { return false }
+            guard let expiration = tx.expirationDate, expiration <= now else { return true }
+            return grace != nil && catalog.tier(for: tx.productID) != nil
         }
         let grandfathered = appTransaction.flatMap { snapshot in
             grandfathering?.admits(snapshot) == true ? snapshot : nil
@@ -126,16 +157,20 @@ public struct EntitlementResolver: Sendable {
             catalog.tier(for: tx.productID).map { (tx, $0) }
         }
         if let (tx, tier) = subscriptions.max(by: { ($0.0.expirationDate ?? .distantFuture) < ($1.0.expirationDate ?? .distantFuture) }) {
+            let lapsed = tx.expirationDate.map { $0 <= now } ?? false
             let subscription = Subscription(
                 productID: tx.productID,
                 tier: tier,
                 expiresAt: tx.expirationDate,
                 willAutoRenew: tx.willAutoRenew,
                 isTrial: tx.isIntroductoryOffer,
-                phase: .active,
-                isFamilyShared: tx.ownership == .familyShared
+                phase: lapsed ? .inGracePeriod : .active,
+                isFamilyShared: tx.ownership == .familyShared,
+                gracePeriodEndsAt: lapsed ? grace : nil
             )
-            return EntitlementResolution(entitlement: .subscribed(subscription), grandfathered: grandfathered, expiresAt: tx.expirationDate)
+            // The expiry timer sleeps toward the effective end: the grace end for a lapsed row, never a past date.
+            return EntitlementResolution(
+                entitlement: .subscribed(subscription), grandfathered: grandfathered, expiresAt: lapsed ? grace : tx.expirationDate)
         }
         // 4–5. Free (a token grant for grandfathered installs is a ledger event, not an entitlement).
         return EntitlementResolution(entitlement: .free, grandfathered: grandfathered, expiresAt: nil)

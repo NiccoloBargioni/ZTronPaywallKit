@@ -88,7 +88,7 @@ struct AppReviewTests {
     /// store calls on launch and foreground are the passive entitlement reads.
     @Test func no_login_anywhere_in_gate_path() async throws {
         let h = try await Harness.free(tokens: 3)
-        await h.store.setReachable(false)
+        await h.store.setNetwork(false)
         for level in [GateLevel.free, .paid, .tokens(1), .tokens(9)] {
             _ = h.engine.evaluate(level, source: source("e"))
             _ = h.engine.run(level, source: source("r")) {}
@@ -105,20 +105,45 @@ struct AppReviewTests {
 @Suite("Edge cases", .serialized)
 @MainActor
 struct EdgeCaseTests {
+    /// B14 (a): a first launch whose store never answers. The entitlement stays `.unknown`, `.paid` and token gates
+    /// fail closed, `.free` runs, no `.storeUnavailable` is published (StoreKit's reads never throw), and the first
+    /// answer reopens the view on screen.
     @Test func first_launch_offline_closes_gates_until_a_resolution_reopens_them() async throws {
         let h = try Harness()
         await h.store.setReachable(false)
-        await h.start()
+        let started = Task { await h.start() }
+        #expect(await eventually { await h.store.pendingReads == 1 })
         #expect(h.engine.entitlement == .unknown)
         let holder = UUID()
         let state = h.engine.openSession(holder: holder, level: .paid, policy: .reserve, source: source("map"), scope: nil)
         #expect(state.failure?.reason == .entitlementUnavailable)
         #expect(h.engine.run(.tokens(1), source: source("t")) { 1 }.failure?.reason == .entitlementUnavailable)
         #expect(h.engine.run(.free, source: source("f")) { 1 }.value == 1)
-        await h.store.setReachable(true)
         await h.store.setEntitlements([.lifetime(id: 1, productID: "pro.lifetime", purchased: h.clock.now)])
-        await h.engine.didBecomeActive()
+        await h.store.setReachable(true)
+        await started.value
+        #expect(h.engine.entitlement.isPaying)
         #expect(h.engine.sessionState(holder)?.isOpen == true)  // the view on screen reopened by itself
+        #expect(!h.events.contains { if case .storeUnavailable = $0 { true } else { false } })
+    }
+
+    /// B14 (b): a relaunch whose store never answers keeps the snapshot (a lifetime purchase), then an empty answer
+    /// resolves `.free` through the launch cause.
+    @Test func a_relaunch_whose_store_never_answers_keeps_the_snapshot_until_it_does() async throws {
+        let h = try Harness()
+        await h.store.setEntitlements([.lifetime(id: 7, productID: "pro.lifetime", purchased: h.clock.now)])
+        await h.start()
+        let engine = try await h.relaunch(start: false)
+        await h.store.setReachable(false)
+        let started = Task { await engine.start() }
+        #expect(await eventually { await h.store.pendingReads == 1 })
+        #expect(engine.entitlement == .lifetime(.purchase(transactionID: 7)) && engine.canPass(.paid))
+        await h.store.setEntitlements([])
+        await h.store.setReachable(true)
+        await started.value
+        #expect(engine.entitlement == .free)
+        #expect(h.events.contains(.entitlementChanged(from: .lifetime(.purchase(transactionID: 7)), to: .free, cause: .launch)))
+        #expect(!h.events.contains { if case .storeUnavailable = $0 { true } else { false } })
     }
 
     @Test func offer_code_redeemed_in_the_app_store_arrives_on_updates() async throws {

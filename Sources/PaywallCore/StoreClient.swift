@@ -23,7 +23,9 @@ public struct StoreTransaction: Hashable, Codable, Sendable {
     public var expirationDate: Date?
     public var revocationDate: Date?
     public var isUpgraded: Bool
-    /// The transaction redeemed the introductory offer (the free trial).
+    /// The transaction redeemed the introductory offer as a free trial. A paid introductory offer (pay as you go, pay
+    /// up front) is a paying period like any other and reads `false` here: `Subscription.isTrial` and the `.freeTrial`
+    /// tier come from this field.
     public var isIntroductoryOffer: Bool
     public var willAutoRenew: Bool
     public var subscriptionGroupID: String?
@@ -68,7 +70,9 @@ public struct AppTransactionSnapshot: Hashable, Codable, Sendable {
     public var originalAppVersion: String
     public var originalPurchaseDate: Date
     public var environment: StoreEnvironment
-    /// `AppTransaction.appTransactionID` when the OS provides it (iOS 16+): the key a server would use.
+    /// `AppTransaction.appTransactionID` when the OS provides it (iOS 16 and later; the SDK back-deploys it): the key
+    /// a server would use, and what a promotional offer signature is bound to. Never empty: a client that has no id
+    /// passes `nil`, and the engine treats `""` as `nil`.
     public var appTransactionID: String?
     public var origin: Origin
     /// The raw signed payload (JWS or PKCS#7), kept for `exportAudit()`.
@@ -92,8 +96,11 @@ public struct AppTransactionSnapshot: Hashable, Codable, Sendable {
         self.signedPayload = signedPayload
     }
 
-    /// The ledger's account partition: SHA-256 of three values both `AppTransaction` and the receipt expose for
-    /// the same Apple Account, so iOS 15 and iOS 16+ devices of one account agree on it.
+    /// The ledger's account partition: SHA-256 of the bundle id, the original purchase second and the original
+    /// application version, three values both `AppTransaction` and the receipt expose for the same Apple Account, so
+    /// iOS 15 and iOS 16+ devices of one account are meant to agree on it. The derivation is the same for both sources;
+    /// that Apple's two sources carry the same values for one install is checked by the production-receipt lane
+    /// (`ProductionReceiptTests`, with `PAYWALL_PRODUCTION_APP_TRANSACTION`), not by CI.
     public var accountKey: String {
         let seconds = Int64(originalPurchaseDate.timeIntervalSince1970.rounded(.down))
         return SHA256Digest.hex("\(bundleID)|\(seconds)|\(originalAppVersion)")
@@ -137,6 +144,11 @@ public protocol StoreClient: Sendable {
     func finish(transactionID: UInt64) async
     /// `Product.SubscriptionInfo.Status` for the group. Goes to the App Store: account screen only.
     func subscriptionPhase(groupID: String) async throws -> SubscriptionPhase?
+    /// When the group's subscription is in a billing grace period, the date the grace ends
+    /// (`RenewalInfo.gracePeriodExpirationDate`); `nil` otherwise. Goes to the App Store. The engine asks only when
+    /// `currentEntitlements` lists a subscription whose expiration has passed, which is what StoreKit does during
+    /// grace; a read that fails offline leaves the lapsed subscription free, as before. The default answers `nil`.
+    func renewalGraceEnd(groupID: String) async throws -> Date?
     func isEligibleForIntroOffer(groupID: String) async -> Bool
     /// `Storefront.current?.countryCode`: the country the prices and offers are for. `nil` where the store cannot say.
     func storefrontCountryCode() async -> String?
@@ -147,4 +159,6 @@ extension StoreClient {
     public func purchase(productID: String) async throws -> StorePurchaseResult {
         try await purchase(productID: productID, offer: nil)
     }
+
+    public func renewalGraceEnd(groupID: String) async throws -> Date? { nil }
 }

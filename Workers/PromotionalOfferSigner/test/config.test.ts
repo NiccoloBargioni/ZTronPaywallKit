@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { handleRequest } from "../src/app";
 import { ConfigError, configFor, loadConfig, parseAllowedOffers, parseBundleIds } from "../src/config";
 import { TEST_ISSUER_ID, TEST_KEY_ID, generateTestKey, testEnv, type EnvOverrides } from "./support";
 
@@ -10,7 +11,10 @@ describe("parseBundleIds", () => {
   it("refuses an empty or malformed list", () => {
     expect(() => parseBundleIds("")).toThrow(ConfigError);
     expect(() => parseBundleIds(" , ")).toThrow(/names no bundle id/);
-    expect(() => parseBundleIds("com.example.app,bad id")).toThrow(/malformed bundle id "bad id"/);
+    // B11: the position, never the value.
+    expect(() => parseBundleIds("com.example.app,bad id")).toThrow(/^APPLE_BUNDLE_IDS: malformed bundle id \(entry 2\)$/);
+    expect(() => parseBundleIds("com.example.app,,bad id")).toThrow(/\(entry 3\)$/);
+    expect(() => parseBundleIds("bad id")).not.toThrow(/bad id/);
   });
 });
 
@@ -52,27 +56,60 @@ describe("loadConfig", () => {
     expect([...config.allowedOffers!.get("pro.monthly")!]).toEqual(["comeback"]);
   });
 
-  it("names the secret at fault, never its value", async () => {
+  /**
+   * B11: every message names the secret at fault, and at most the position of the bad entry; no part of the value
+   * ever appears, in the rejection or in the line the worker logs. Each case carries a marker, and the key cases are
+   * checked against every 16-character window of the key's own base64 body past its fixed 48-character prefix.
+   */
+  it("names the secret at fault and never any part of its value, in the error and in the log", async () => {
+    const m = "zq7MARKERzq7";
+    const { key: own } = await testEnv();
+    const body = own.pem.replace(/-----[A-Z ]+-----/g, "").replace(/\s+/g, "");
+    const windows = Array.from({ length: Math.floor((body.length - 48) / 16) }, (_, i) => body.slice(48 + 16 * i, 64 + 16 * i));
+    expect(windows.length).toBeGreaterThan(3);
     const cases: [EnvOverrides, RegExp][] = [
-      [{ APPLE_IAP_PRIVATE_KEY: undefined }, /APPLE_IAP_PRIVATE_KEY is not set/],
-      [{ APPLE_IAP_PRIVATE_KEY: "   " }, /APPLE_IAP_PRIVATE_KEY is not set/],
-      [{ APPLE_IAP_KEY_ID: undefined }, /APPLE_IAP_KEY_ID is not set/],
-      [{ APPLE_IAP_KEY_ID: "short" }, /APPLE_IAP_KEY_ID is not a 10-character/],
-      [{ APPLE_IAP_KEY_ID: "abcde12345" }, /APPLE_IAP_KEY_ID is not a 10-character/],
-      [{ APPLE_IAP_ISSUER_ID: undefined }, /APPLE_IAP_ISSUER_ID is not set/],
-      [{ APPLE_IAP_ISSUER_ID: "57246542-96fe-1a63e053-0824d011072a" }, /APPLE_IAP_ISSUER_ID is not a UUID/],
-      [{ APPLE_BUNDLE_IDS: undefined }, /APPLE_BUNDLE_IDS is not set/],
-      [{ APPLE_BUNDLE_IDS: "bad id" }, /malformed bundle id/],
-      [{ ALLOWED_OFFERS: "{" }, /ALLOWED_OFFERS is not JSON/],
-      [{ APPLE_IAP_PRIVATE_KEY: "-----BEGIN EC PRIVATE KEY-----\nAAAA\n-----END EC PRIVATE KEY-----" }, /SEC1/],
+      [{ APPLE_IAP_PRIVATE_KEY: undefined }, /^APPLE_IAP_PRIVATE_KEY is not set$/],
+      [{ APPLE_IAP_PRIVATE_KEY: "   " }, /^APPLE_IAP_PRIVATE_KEY is not set$/],
+      [{ APPLE_IAP_KEY_ID: undefined }, /^APPLE_IAP_KEY_ID is not set$/],
+      [{ APPLE_IAP_KEY_ID: `K${m}` }, /^APPLE_IAP_KEY_ID is not a 10-character/],
+      [{ APPLE_IAP_KEY_ID: "abcde12345" }, /^APPLE_IAP_KEY_ID is not a 10-character/],
+      [{ APPLE_IAP_ISSUER_ID: undefined }, /^APPLE_IAP_ISSUER_ID is not set$/],
+      [{ APPLE_IAP_ISSUER_ID: `I${m}` }, /^APPLE_IAP_ISSUER_ID is not a UUID$/],
+      [{ APPLE_BUNDLE_IDS: undefined }, /^APPLE_BUNDLE_IDS is not set$/],
+      [{ APPLE_BUNDLE_IDS: `com.example.app, com.${m}_x` }, /^APPLE_BUNDLE_IDS: malformed bundle id \(entry 2\)$/],
+      [{ APPLE_BUNDLE_IDS: `com.${m}.app;com.example.app` }, /^APPLE_BUNDLE_IDS: malformed bundle id \(entry 1\)$/],
+      [{ APPLE_BUNDLE_IDS: own.pem }, /^APPLE_BUNDLE_IDS: malformed bundle id \(entry 1\)$/],
+      [{ ALLOWED_OFFERS: "{" }, /^ALLOWED_OFFERS is not JSON$/],
+      [{ ALLOWED_OFFERS: `{"pro ${m}": ["comeback"]}` }, /^ALLOWED_OFFERS: malformed product id$/],
+      [{ ALLOWED_OFFERS: `{"pro.${m}": ["has space"]}` }, /^ALLOWED_OFFERS: a product must list offer ids$/],
+      [{ APPLE_IAP_PRIVATE_KEY: own.pem.replace(/PRIVATE KEY/g, "EC PRIVATE KEY") }, /SEC1/],
+      [{ APPLE_IAP_PRIVATE_KEY: own.pem.replace(body.slice(8, 16), "AAAAAAAA") }, /^not an EC P-256 private key in PKCS#8 form$/],
     ];
     for (const [overrides, message] of cases) {
+      const label = JSON.stringify(Object.keys(overrides));
       const { env } = await testEnv(overrides);
-      await expect(loadConfig(env), JSON.stringify(overrides)).rejects.toThrow(message);
+      let thrown: unknown;
+      try {
+        await loadConfig(env);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown, label).toBeInstanceOf(Error);
+      const text = (thrown as Error).message;
+      expect(text, label).toMatch(message);
+      expect(text, label).not.toContain(m);
+      for (const window of windows) expect(text, label).not.toContain(window);
+      // At the sink: the worker logs that message, and nothing of the value, while answering 500 misconfigured.
+      const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+      const response = await handleRequest(new Request("https://signer.example/v1/keys"), env);
+      expect(response.status, label).toBe(500);
+      expect(await response.json()).toEqual({ error: "misconfigured" });
+      const lines = logged.mock.calls.map((call) => String(call[0])).join("\n");
+      expect(lines, label).toContain(JSON.stringify(text));
+      expect(lines, label).not.toContain(m);
+      for (const window of windows) expect(lines, label).not.toContain(window);
+      logged.mockRestore();
     }
-    const { env, key } = await testEnv();
-    const { APPLE_IAP_PRIVATE_KEY: _dropped, ...withoutKey } = env;
-    await expect(loadConfig(withoutKey)).rejects.not.toThrow(new RegExp(key.pem.slice(30, 60)));
   });
 
   it("accepts the key with its newlines escaped and the issuer id in upper case", async () => {

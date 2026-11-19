@@ -22,7 +22,9 @@ public struct PaywallFailure: Error, Identifiable, Hashable, Codable, Sendable {
     public enum Reason: Hashable, Codable, Sendable {
         case requiresPaid
         case insufficientTokens(needed: Int, available: Int)
-        /// The store is unreachable and no snapshot exists (fresh install, offline).
+        /// The entitlement is still `.unknown`: before the launch resolution has answered on an install with no
+        /// snapshot on disk (a fresh install whose first resolution is in flight, or one StoreKit never answers), and
+        /// on an unconfigured facade. Gates fail closed until a resolution lands.
         case entitlementUnavailable
         /// The journal could not be written, so no draw can be made durable. Fails closed.
         case storageUnavailable

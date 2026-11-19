@@ -132,6 +132,25 @@ struct LedgerTests {
         #expect(SubscriptionTier.allCases.allSatisfy { $0.periodInDays >= 7 })
     }
 
+    /// A1: a Keychain item that names no last event (an earlier build's, or an install that wrote no event of its
+    /// own) stands in for its account's history until the engine settles it; one whose last event is here, or one for
+    /// another account, counts nothing on top of the ledger.
+    @Test func a_baseline_without_a_last_event_stands_until_settled() {
+        var ledger = Ledger()
+        let legacy = WalletSnapshot(accountKey: unboundAccountKey, balance: 42, lastEventID: nil, headHash: paywallGenesisHash)
+        #expect(ledger.balance(for: unboundAccountKey, baseline: legacy) == 42)
+        let grant = LedgerEvent(
+            id: "grant:1", at: Date(timeIntervalSince1970: 1), deviceID: "d", accountKey: unboundAccountKey, source: nil,
+            previousHash: paywallGenesisHash, kind: .grant(tokens: 3, reason: "r"))
+        _ = ledger.append(grant)
+        #expect(ledger.balance(for: unboundAccountKey, baseline: legacy) == 45, "the baseline plus what this install wrote")
+        let seen = WalletSnapshot(accountKey: unboundAccountKey, balance: 42, lastEventID: "grant:1", headHash: paywallGenesisHash)
+        #expect(ledger.balance(for: unboundAccountKey, baseline: seen) == 3, "its last event is here: the history is complete")
+        let other = WalletSnapshot(accountKey: "other", balance: 42, lastEventID: nil, headHash: paywallGenesisHash)
+        #expect(ledger.balance(for: unboundAccountKey, baseline: other) == 3)
+        #expect(ledger.balance(for: unboundAccountKey) == 3)
+    }
+
     @Test func outcome_get_and_value() throws {
         let failure = PaywallFailure(reason: .requiresPaid, level: .paid, source: PaywallSource(fileID: "f", function: "g", line: 9), at: t0)
         #expect(failure.source.id == "f:9")

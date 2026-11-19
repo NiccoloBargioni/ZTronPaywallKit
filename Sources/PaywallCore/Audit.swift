@@ -65,7 +65,12 @@ public protocol PaywallAuditSink: Sendable {
 
 /// A sink that can tell which debits it already recorded, so the engine can repair missing records at launch.
 public protocol PaywallAuditRepairing: PaywallAuditSink {
+    /// Every debit the sink knows: consumed, refunded, or repaired already. The whole retained set; the launch
+    /// repair asks `recordedDebitIDs(among:)` instead.
     func recordedDebitIDs() async -> Set<String>
+    /// Which of `candidates` the sink knows. The default intersects `recordedDebitIDs()`; a sink over files answers
+    /// without decoding every record. Report an id only from a record actually read: a false hit suppresses a repair.
+    func recordedDebitIDs(among candidates: Set<String>) async -> Set<String>
     func lastRecordHash() async -> String?
     /// The `at` of the oldest record the sink still holds once it has dropped older ones; `nil` while it holds
     /// everything it ever wrote. The launch repair leaves debits older than this alone: their records may simply
@@ -75,6 +80,10 @@ public protocol PaywallAuditRepairing: PaywallAuditSink {
 
 extension PaywallAuditRepairing {
     public func retainedSince() async -> Date? { nil }
+
+    public func recordedDebitIDs(among candidates: Set<String>) async -> Set<String> {
+        await recordedDebitIDs().intersection(candidates)
+    }
 }
 
 /// Forwards every record to a closure: the hook for analytics.
@@ -169,15 +178,37 @@ public actor JournalSink: PaywallAuditRepairing {
 
     /// The debits the retained files know: consumed, refunded, or repaired already.
     public func recordedDebitIDs() async -> Set<String> {
-        Set(
-            records().compactMap { record in
-                switch record.event {
-                case .tokensConsumed(_, _, let debitID, _), .tokensRefunded(let debitID, _), .auditRepaired(let debitID):
-                    return debitID
-                default:
-                    return nil
-                }
-            })
+        Set(records().compactMap(Self.debitID))
+    }
+
+    /// The debit a record is about, for the three events that carry one.
+    private static func debitID(of record: AuditRecord) -> String? {
+        switch record.event {
+        case .tokensConsumed(_, _, let debitID, _), .tokensRefunded(let debitID, _), .auditRepaired(let debitID):
+            return debitID
+        default:
+            return nil
+        }
+    }
+
+    /// Which of `candidates` the files know, scanning the newest file first and decoding only the lines that can
+    /// carry a debit (the three debit-bearing events all encode a `"debitID"` key), until every candidate is found.
+    /// Wall-clock dates are not used to stop early: a clock set back would make newer records look older.
+    public func recordedDebitIDs(among candidates: Set<String>) async -> Set<String> {
+        var found: Set<String> = []
+        let marker = Data("\"debitID\"".utf8)
+        let decoder = CanonicalJSON.decoder()
+        for url in urlsNewestFirst {
+            guard let data = FileManager.default.contents(atPath: url.path) else { continue }
+            for line in data.split(separator: 0x0A) where line.range(of: marker) != nil {
+                guard let record = try? decoder.decode(AuditRecord.self, from: Data(line)), let debitID = Self.debitID(of: record),
+                    candidates.contains(debitID)
+                else { continue }
+                found.insert(debitID)
+                if found.count == candidates.count { return found }
+            }
+        }
+        return found
     }
 
     /// The hash of the newest record, read from the tail of the newest file that has one.

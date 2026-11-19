@@ -692,6 +692,20 @@
             failure.forgetClaim()
             await dismissEverything(window)
         }
+
+        /// A UIKit-created root with the bridge's own sheet: a denial under it is presented by the hosting controller.
+        @Test func a_hosting_controller_with_its_own_sheet_presents_denials() async {
+            _ = await configureShared(tokens: 0)
+            let controller = PaywallHostingController(rootView: Text("root"), presentsPaywall: true) { _ in AnyView(Color.orange) }
+            let window = makeWindow()
+            window.rootViewController = controller
+            window.makeKeyAndVisible()
+            await pump(window, rounds: 2)
+            _ = Paywall.shared.engine?.openSession(
+                holder: UUID(), level: .paid, policy: .reserve, source: PaywallSource(id: "deep", fileID: "f", function: "g", line: 1), scope: nil)
+            #expect(await until(window) { controller.presentedViewController != nil }, "the denial is presented by the bridge's sheet")
+            await dismissEverything(window)
+        }
     }
     }
 #endif

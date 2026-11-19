@@ -19,7 +19,11 @@ extension Paywall {
     }
 
     /// One zip for a support case or an App Store dispute: the audit journal, the ledger, the derived lease table,
-    /// and the raw signed AppTransaction (or receipt). Tamper-evident and timestamped twice.
+    /// and the raw signed AppTransaction (or receipt). Hash-chained and timestamped twice (wall clock and uptime):
+    /// it detects corruption and edits that do not rewrite the records after them. It is not tamper-proof against
+    /// whoever controls the device: the chains are unkeyed, their heads are not anchored off the device, and dropping
+    /// the newest records goes unnoticed. Only the signed AppTransaction or receipt can be verified by a third party;
+    /// when evidence must hold against the user, forward records or the chain head to your server with a `ClosureSink`.
     public func exportAudit() async throws -> URL {
         guard let engine else { throw ExportError.notConfigured }
         await engine.flushAudit()

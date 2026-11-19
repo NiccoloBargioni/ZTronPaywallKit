@@ -39,15 +39,17 @@ struct WelcomeTokensTests {
         #expect(!h.engine.ledger.contains("grant:welcome"))
     }
 
+    /// A store client whose launch read fails (a host-written one; StoreKit's never throws) still gets the grant, and
+    /// the gates wait for a resolution.
     @Test func a_first_launch_with_the_store_unreachable_still_grants_and_the_gates_wait_for_the_resolution() async throws {
         let h = try Harness(settings: settings(welcome: 100))
-        await h.store.setReachable(false)
+        await h.store.setPassiveReadFailure(.unreachable)
         await h.start()
         #expect(h.engine.entitlement == .unknown)
         #expect(h.engine.wallet.balance == 100)
         #expect(h.engine.tier == nil)
         #expect(h.engine.run(.tokens(1), source: source("t")) { 1 }.failure?.reason == .entitlementUnavailable)
-        await h.store.setReachable(true)
+        await h.store.setPassiveReadFailure(nil)
         await h.engine.refresh(cause: .foreground)
         #expect(h.engine.tier == .tokens)
         #expect(h.engine.run(.tokens(1), source: source("t")) { 1 }.value == 1)

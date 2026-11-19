@@ -65,6 +65,7 @@ extension GateEngine {
     /// calls `complete` or `abort`. `holder` is the committing view's session, if any.
     public func begin(_ level: GateLevel, source: PaywallSource, scope: String? = nil, holder: UUID? = nil) -> GateBegin {
         let gateID = source.id
+        warnIfInvalid(level, source)
         reportExpiredLease(gateID)
         // A view-held reservation for this gate is what a commit spends, so it does not count against itself.
         let consumed = reservations.reservation(forGate: gateID, preferring: holder)

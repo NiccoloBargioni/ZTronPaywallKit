@@ -75,6 +75,7 @@
 
             let store = FakeStore(entitlements: [.lifetime(id: 7, productID: "pro.lifetime", purchased: Date())], products: products)
             var configuration = Paywall.Configuration(catalog: catalog)
+            configuration.fileKeyStore = InMemoryFileKeyStore()
             configuration.store = store
             configuration.clock = FakeClock()
             configuration.storageDirectory = makeTemporaryPaywallDirectory()
